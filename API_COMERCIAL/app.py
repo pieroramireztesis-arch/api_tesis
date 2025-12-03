@@ -1,8 +1,16 @@
 from flask import Flask
 from flask_jwt_extended import JWTManager
+
+# 👇 AGREGAR ESTO JUSTO AQUÍ
+import os
+import sys
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+if BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+# 👆 HASTA AQUÍ
+
 from config import SecretKey
-
-
 
 from ws.estudiante import ws_estudiante
 from ws.usuario import ws_usuario
