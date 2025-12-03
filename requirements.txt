@@ -3,3 +3,8 @@ flask-jwt-extended==4.6.0
 psycopg2-binary
 gunicorn
 python-dotenv==1.0.1
+
+# Para el modelo del tutor
+numpy
+scikit-learn
+joblib
