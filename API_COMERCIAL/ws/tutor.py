@@ -10,7 +10,9 @@ from conexionBD import Conexion
 ws_tutor = Blueprint("ws_tutor", __name__, url_prefix="/tutor")
 
 # Carpeta base: API_COMERCIAL
-BASE_DIR = os.path.dirname(os.path.dirname(__file__))  # carpeta API_COMERCIAL
+BASE_DIR = os.path.dirname(os.path.dirname(__file__))
+# URL base del proyecto WEB (donde están las imágenes en /static)
+WEB_BASE_URL = "http://192.168.1.13:5000"
 
 # Carpeta donde se guardarán los desarrollos de los alumnos
 DESARROLLOS_FOLDER = os.path.join(BASE_DIR, "static", "desarrollos_alumno")
@@ -24,7 +26,6 @@ UMBRAL_APROBADO = 60.0  # igual que en train_model.py
 # ================================
 #  Carga del modelo de Tutor (ML)
 # ================================
-# Usar modelo_tutor.pkl que está dentro de API_COMERCIAL
 MODEL_PATH = os.path.join(BASE_DIR, "modelo_tutor.pkl")
 MODELO_TUTOR = None
 ENCODER_NIVEL = None
@@ -62,8 +63,6 @@ def calcular_features_competencia(cursor, id_estudiante, id_competencia):
       - min_puntaje
       - max_puntaje
       - tasa_aprobados
-
-    Devuelve un array numpy con shape (1, 5), o None si no hay datos.
     """
     cursor.execute(
         """
@@ -148,9 +147,6 @@ def predecir_nivel_competencia(cursor, id_estudiante, id_competencia):
     el nivel inicial manual almacenado en la tabla ESTUDIANTE
     (operaciones_basicas, ecuaciones, funciones, geometria) según el área
     de la competencia.
-
-    Devuelve:
-        nivel_texto: "bajo" / "medio" / "alto" (o None si no se puede predecir)
     """
     nivel_texto = None
 
@@ -210,11 +206,6 @@ def actualizar_nivel_estudiante_competencia(
     """
     Actualiza la tabla nivel_estudiante_competencia con la predicción
     del modelo, y calcula también un nivel global para el estudiante.
-
-    nivel_texto: "bajo" / "medio" / "alto"
-
-    Devuelve:
-        (nivel_competencia_int, nivel_global_texto)
     """
     if nivel_texto is None:
         return None, None
@@ -294,7 +285,6 @@ def actualizar_nivel_estudiante_competencia(
 
 # ================================
 #  GET /tutor/ejercicio_siguiente
-#  Devuelve un ejercicio + opciones
 # ================================
 @ws_tutor.route("/ejercicio_siguiente", methods=["GET"])
 def ejercicio_siguiente():
@@ -315,18 +305,18 @@ def ejercicio_siguiente():
         where = []
         params = []
 
-        # ---- filtro por dominio (competencia) ----
+        # filtro por dominio (competencia)
         if id_dominio:
             where.append("e.id_competencia = %s")
             params.append(id_dominio)
 
-        # ---- filtro por nivel según ajuste (aún compatible con tu lógica anterior) ----
+        # filtro por nivel según ajuste
         if ajuste == "mas_dificil":
             where.append("c.nivel >= 2")
         elif ajuste == "mas_facil":
             where.append("c.nivel = 1")
 
-        # ---- no repetir ejercicios ya respondidos ----
+        # no repetir ejercicios ya respondidos
         where.append(
             """
             NOT EXISTS(
@@ -339,7 +329,7 @@ def ejercicio_siguiente():
         )
         params.append(id_estudiante)
 
-        # ---- solo ejercicios con opciones ----
+        # solo ejercicios con opciones
         where.append(
             """
             EXISTS(
@@ -386,18 +376,46 @@ def ejercicio_siguiente():
 
         id_ejercicio = ejercicio["id_ejercicio"]
         id_competencia = ejercicio["id_competencia"]
-        imagen_rel = ejercicio["imagen_url"]  # puede ser None
+        imagen_rel = ejercicio["imagen_url"]
 
-        # ---- construir URL absoluta si hay imagen ----
+        # ================================
+        # Normalizar URL de la imagen
+        # Puede venir como:
+        #   - 'ejercicios_ayuda/ej_6.jpg'
+        #   - 'static/ejercicios_ayuda/ej_6.jpg'
+        #   - '/static/ejercicios_ayuda/ej_6.jpg'
+        #   - o ya una URL absoluta 'http://...'
+        # ================================
         if imagen_rel:
-            base = request.host_url.rstrip("/")  # ej: http://192.168.1.13:3008
-            if not imagen_rel.startswith("/"):
-                imagen_rel = "/" + imagen_rel
-            imagen_url_abs = base + imagen_rel
+            # Si ya es URL absoluta, la usamos tal cual
+            if imagen_rel.startswith("http://") or imagen_rel.startswith("https://"):
+                imagen_url_abs = imagen_rel
+            else:
+                # Asegurar que empiece por /static/...
+                # Quitamos espacios
+                imagen_rel = imagen_rel.strip()
+
+                # Si comienza por 'static/', le agregamos la barra inicial
+                if imagen_rel.startswith("static/"):
+                    imagen_rel = "/" + imagen_rel
+
+                # Si NO empieza por '/static/', asumimos que es solo la carpeta/archivo
+                if not imagen_rel.startswith("/static/"):
+                    # ejemplo: 'ejercicios_ayuda/ej_6.jpg' -> '/static/ejercicios_ayuda/ej_6.jpg'
+                    if imagen_rel.startswith("/"):
+                        imagen_rel = "/static" + imagen_rel
+                    else:
+                        imagen_rel = "/static/" + imagen_rel
+
+                # 🚨 Importante: las imágenes de ejercicios viven en el proyecto WEB (puerto 5000)
+                base = WEB_BASE_URL.rstrip("/")
+                imagen_url_abs = base + imagen_rel
+
         else:
             imagen_url_abs = None
 
-        # ---- opciones ----
+
+        # opciones
         cursor.execute(
             """
             SELECT id_opcion, letra, descripcion
@@ -430,7 +448,7 @@ def ejercicio_siguiente():
             for o in opciones_rows
         ]
 
-        # ---- pista opcional ----
+        # pista opcional
         cursor.execute(
             """
             SELECT mensaje
@@ -454,6 +472,7 @@ def ejercicio_siguiente():
             "opciones": opciones,
             "pista": pista,
             "mensaje": None,
+            "requiereDesarrollo": True,
         }
 
         return jsonify(data), 200
@@ -466,9 +485,6 @@ def ejercicio_siguiente():
         con.close()
 
 
-# ============================================
-#  FUNCION AUX: Actualizar progreso_estudiante
-# ============================================
 # =========================================
 #  FUNCION AUX: Actualizar progreso_estudiante
 # =========================================
@@ -482,9 +498,6 @@ def actualizar_progreso_estudiante(con, cursor, id_estudiante):
       - 'regularidad_equivalencia_cambio' -> ecuaciones
       - 'forma_movimiento_localizacion'   -> funciones
       - 'gestion_datos_incertidumbre'     -> geometria
-
-    También calcula progreso_general como promedio de las 4 competencias.
-    Todos los valores se manejan en escala 0..100.
     """
 
     cursor.execute(
@@ -501,7 +514,6 @@ def actualizar_progreso_estudiante(con, cursor, id_estudiante):
     )
     rows = cursor.fetchall()
 
-    # Competencias MINEDU
     cant = reg = forma = datos = None
 
     for row in rows:
@@ -518,7 +530,6 @@ def actualizar_progreso_estudiante(con, cursor, id_estudiante):
         elif area == "gestion_datos_incertidumbre":
             datos = promedio_int
 
-    # Progreso general = promedio de las competencias que tengan dato
     valores = [v for v in [cant, reg, forma, datos] if v is not None]
     progreso_general = int(round(sum(valores) / len(valores))) if valores else None
 
@@ -538,8 +549,6 @@ def actualizar_progreso_estudiante(con, cursor, id_estudiante):
 
 # ================================
 #  POST /tutor/responder
-#  Registra respuesta + puntaje
-#  y devuelve idRespuesta + nivel ML
 # ================================
 @ws_tutor.route("/responder", methods=["POST"])
 def responder():
@@ -582,7 +591,7 @@ def responder():
         id_competencia = row["id_competencia"]
         nivel_competencia = row["nivel_competencia"]
 
-        # 2) Registrar respuesta (sin desarrollo todavía)
+        # 2) Registrar respuesta
         cursor.execute(
             """
             INSERT INTO respuestas_estudiantes
@@ -637,37 +646,51 @@ def responder():
                 id_ejercicio,
             ),
         )
+
         # 5) Actualizar progreso general del estudiante (por áreas)
         actualizar_progreso_estudiante(con, cursor, id_estudiante)
 
-        # 6) Predicción con el modelo ML (nivel por competencia
-        #    o, en su defecto, nivel inicial manual del docente)
-        nivel_ml_texto = predecir_nivel_competencia(
-            cursor, id_estudiante, id_competencia
-        )
+        # 6) Predicción con el modelo ML
+        nivel_ml_texto = None
         nivel_competencia_int = None
         nivel_global_texto = None
 
-        if nivel_ml_texto is not None:
-            nivel_competencia_int, nivel_global_texto = (
-                actualizar_nivel_estudiante_competencia(
-                    cursor, id_estudiante, id_competencia, nivel_ml_texto
-                )
+        try:
+            nivel_ml_texto = predecir_nivel_competencia(
+                cursor, id_estudiante, id_competencia
             )
-            # Ajuste de dificultad en función del nivel ML
-            if nivel_ml_texto == "alto":
-                nuevo_ajuste = "mas_dificil"
-                mostrar_pista = False
-                mensaje = "Vas muy bien, subimos un poco la dificultad."
-            elif nivel_ml_texto == "medio":
-                nuevo_ajuste = "igual"
-                mostrar_pista = uso_pista or not es_correcta
-                mensaje = "Mantendremos el nivel actual y reforzaremos."
-            else:  # "bajo"
-                nuevo_ajuste = "mas_facil"
-                mostrar_pista = True
-                mensaje = "Bajaremos un poco la dificultad para reforzar la competencia."
-        else:
+        except Exception as e:
+            print("⚠️ Error en predecir_nivel_competencia:", e)
+            nivel_ml_texto = None
+
+        # Intentar actualizar tabla nivel_estudiante_competencia;
+        # si algo falla, seguimos con la lógica por tiempo/pista.
+        if nivel_ml_texto is not None:
+            try:
+                nivel_competencia_int, nivel_global_texto = (
+                    actualizar_nivel_estudiante_competencia(
+                        cursor, id_estudiante, id_competencia, nivel_ml_texto
+                    )
+                )
+
+                if nivel_ml_texto == "alto":
+                    nuevo_ajuste = "mas_dificil"
+                    mostrar_pista = False
+                    mensaje = "Vas muy bien, subimos un poco la dificultad."
+                elif nivel_ml_texto == "medio":
+                    nuevo_ajuste = "igual"
+                    mostrar_pista = uso_pista or not es_correcta
+                    mensaje = "Mantendremos el nivel actual y reforzaremos."
+                else:  # "bajo"
+                    nuevo_ajuste = "mas_facil"
+                    mostrar_pista = True
+                    mensaje = "Bajaremos un poco la dificultad para reforzar la competencia."
+
+            except Exception as e:
+                print("⚠️ Error actualizando nivel_estudiante_competencia:", e)
+                nivel_ml_texto = None  # forzar uso de la lógica clásica
+
+        if nivel_ml_texto is None:
             # Fallback: lógica antigua basada en tiempo y pista
             RAPIDO = 45
             LENTO = 90
@@ -695,7 +718,6 @@ def responder():
                     nuevo_ajuste = "igual"
                     mostrar_pista = True
                     mensaje = "Intentemos un nivel similar con pista."
-
         con.commit()
 
         return jsonify(
@@ -705,10 +727,9 @@ def responder():
                 "mensaje": mensaje,
                 "nuevoAjuste": nuevo_ajuste,
                 "idRespuesta": id_respuesta,
-                # Campos extra para tesis / dashboards
-                "nivelMLCompetencia": nivel_ml_texto,          # "bajo/medio/alto"
-                "nivelCompetenciaInt": nivel_competencia_int,  # 1..7 (aprox)
-                "nivelGlobal": nivel_global_texto,             # "bajo/medio/alto"
+                "nivelMLCompetencia": nivel_ml_texto,
+                "nivelCompetenciaInt": nivel_competencia_int,
+                "nivelGlobal": nivel_global_texto,
             }
         ), 200
 
@@ -723,7 +744,6 @@ def responder():
 
 # ============================================
 #  POST /tutor/subir_desarrollo
-#  Sube imagen/PDF del desarrollo del alumno
 # ============================================
 @ws_tutor.route("/subir_desarrollo", methods=["POST"])
 def subir_desarrollo():
@@ -760,8 +780,8 @@ def subir_desarrollo():
         ruta_relativa = f"/static/desarrollos_alumno/{filename}"
 
         # URL absoluta con host + puerto del API
-        base = request.host_url.rstrip("/")  # ej: http://127.0.0.1:3008
-        url_abs = base + ruta_relativa       # ej: http://127.0.0.1:3008/static/...
+        base = request.host_url.rstrip("/")
+        url_abs = base + ruta_relativa
 
         # Guarda la URL COMPLETA en la BD
         con = Conexion()
@@ -806,7 +826,6 @@ def subir_desarrollo():
 
 # ================================
 #  GET /tutor/nivel_actual
-#  Devuelve el nivel actual del estudiante en una competencia
 # ================================
 @ws_tutor.route("/nivel_actual", methods=["GET"])
 def nivel_actual():
@@ -828,10 +847,8 @@ def nivel_actual():
     cursor = con.cursor()
 
     try:
-        # Predicción usando el modelo ML o el nivel inicial manual
         nivel_ml = predecir_nivel_competencia(cursor, id_estudiante, id_competencia)
 
-        # Datos crudos de la BD (para reporte)
         cursor.execute(
             """
             SELECT
@@ -852,7 +869,7 @@ def nivel_actual():
                 "status": True,
                 "idEstudiante": id_estudiante,
                 "idCompetencia": id_competencia,
-                "nivelML": nivel_ml,                   # "bajo/medio/alto"
+                "nivelML": nivel_ml,
                 "totalIntentos": int(total_intentos),
                 "promedioPuntaje": float(promedio_puntaje),
             }
@@ -867,15 +884,13 @@ def nivel_actual():
 
 
 # ================================
-#  GET /tutor/sugerencias/<id_estudiante>/<id_competencia>
-#  Lista de ejercicios recomendados por el modelo
+#  GET /tutor/sugerencias/...
 # ================================
 @ws_tutor.route("/sugerencias/<int:id_estudiante>/<int:id_competencia>", methods=["GET"])
 def sugerencias_ejercicios(id_estudiante: int, id_competencia: int):
     """
     Devuelve una lista de ejercicios recomendados para un estudiante
-    en una competencia específica, usando el nivel predicho por el modelo
-    o, si no hay historial, el nivel inicial manual del docente.
+    en una competencia específica.
     """
     limite = request.args.get("limite", default=5, type=int)
 
@@ -886,8 +901,6 @@ def sugerencias_ejercicios(id_estudiante: int, id_competencia: int):
         # 1) Obtener nivel ML del estudiante en esa competencia
         nivel_ml = predecir_nivel_competencia(cursor, id_estudiante, id_competencia)
 
-        # Filtro por nivel de competencia (columna competencias.nivel)
-        # Puedes ajustar estos rangos según tu diseño (1..7)
         filtro_nivel = ""
         if nivel_ml == "bajo":
             filtro_nivel = "AND c.nivel <= 3"
@@ -935,7 +948,7 @@ def sugerencias_ejercicios(id_estudiante: int, id_competencia: int):
 
         ids_ejercicios = [e["id_ejercicio"] for e in ejercicios]
 
-        # 3) Cargar opciones de todos esos ejercicios
+        # 3) Cargar opciones
         cursor.execute(
             """
             SELECT id_opcion, letra, descripcion, id_ejercicio
@@ -958,20 +971,46 @@ def sugerencias_ejercicios(id_estudiante: int, id_competencia: int):
                 }
             )
 
-        # 4) Armar respuesta
+        # 4) Armar DTO con URL ABSOLUTA para la imagen
         ejercicios_dto = []
+        # Usamos la misma base del proyecto WEB para las imágenes de ejercicios
+        base = WEB_BASE_URL.rstrip("/")
+
+
         for e in ejercicios:
             ide = e["id_ejercicio"]
+            imagen_rel = e["imagen_url"]
+
+            if imagen_rel:
+                if imagen_rel.startswith("http://") or imagen_rel.startswith("https://"):
+                    imagen_url_abs = imagen_rel
+                else:
+                    imagen_rel = imagen_rel.strip()
+
+                    if imagen_rel.startswith("static/"):
+                        imagen_rel = "/" + imagen_rel
+
+                    if not imagen_rel.startswith("/static/"):
+                        if imagen_rel.startswith("/"):
+                            imagen_rel = "/static" + imagen_rel
+                        else:
+                            imagen_rel = "/static/" + imagen_rel
+
+                    imagen_url_abs = base + imagen_rel
+            else:
+                imagen_url_abs = None
+
             ejercicios_dto.append(
                 {
                     "idEjercicio": ide,
                     "idCompetencia": e["id_competencia"],
                     "enunciado": e["enunciado"],
-                    "imagenUrl": e["imagen_url"],
+                    "imagenUrl": imagen_url_abs,
                     "opciones": opciones_por_ejercicio.get(ide, []),
                     "pista": None,
                 }
             )
+
 
         return jsonify(
             {
