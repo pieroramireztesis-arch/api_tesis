@@ -8,7 +8,7 @@ ws_progreso = Blueprint('ws_progreso', __name__, url_prefix='/progreso')
 
 # ==========================
 #  POST /progreso
-#  Registrar progreso
+#  Registrar progreso (si se usa)
 # ==========================
 @ws_progreso.route('', methods=['POST'])
 def registrar_progreso():
@@ -21,7 +21,6 @@ def registrar_progreso():
         estado = data.get('estado')
         tiempo_respuesta = data.get('tiempo_respuesta')
 
-        # Validación más clara (sin usar all con un boolean dentro)
         if id_estudiante is None or id_ejercicio is None or nivel_actual is None or estado is None:
             return jsonify({
                 "status": False,
@@ -58,9 +57,10 @@ def listar_progreso():
             "mensaje": str(e)
         }), 500
 
+
 # ==========================
 #  GET /progreso/resumen?idEstudiante=4
-#  Resumen simple: % global + #ejercicios (basado en PUNTAJES)
+#  Resumen global basado en EJERCICIOS COMPLETADOS
 # ==========================
 @ws_progreso.route('/resumen', methods=['GET'])
 def resumen_progreso():
@@ -68,10 +68,15 @@ def resumen_progreso():
     Parámetro:
       - idEstudiante (query) -> obligatorio
 
+    Nueva lógica:
+      - ejerciciosDesarrollados = # de ejercicios distintos que el estudiante ha respondido
+        (en las competencias 1..4)
+      - nivelPorcentaje = (ejerciciosDesarrollados / ejerciciosTotales) * 100
+
     Respuesta:
       {
         "ejerciciosDesarrollados": int,
-        "nivelPorcentaje": int,   # promedio de puntajes 0..100
+        "nivelPorcentaje": int,   # 0..100
         "resumenTexto": str,
         "status": true/false
       }
@@ -87,38 +92,45 @@ def resumen_progreso():
     cur = con.cursor()
 
     try:
-        # Usamos la misma fuente que /por_competencia: tabla PUNTAJES
+        # Total de ejercicios disponibles (competencias MINEDU 1..4)
+        # y cuántos de ellos ya ha resuelto el estudiante.
         cur.execute("""
             SELECT
-                COUNT(*)        AS total_ej,
-                AVG(puntaje)    AS promedio
-            FROM puntajes
-            WHERE id_estudiante = %s
+                COUNT(DISTINCT e.id_ejercicio) AS total_ejercicios,
+                COUNT(DISTINCT r.id_ejercicio) AS resueltos
+            FROM ejercicios e
+            LEFT JOIN respuestas_estudiantes r
+                   ON r.id_ejercicio = e.id_ejercicio
+                  AND r.id_estudiante = %s
+            WHERE e.id_competencia BETWEEN 1 AND 4
         """, (id_estudiante,))
 
         row = cur.fetchone() or {}
-        total = row.get("total_ej", 0) or 0
-        promedio = row.get("promedio", None)
+        total = row.get("total_ejercicios", 0) or 0
+        resueltos = row.get("resueltos", 0) or 0
 
-        if promedio is None:
-            porcentaje = 0
+        if total > 0:
+            porcentaje = int(round(100.0 * float(resueltos) / float(total)))
         else:
-            porcentaje = int(round(float(promedio)))
-            if porcentaje < 0:
-                porcentaje = 0
-            if porcentaje > 100:
-                porcentaje = 100
+            porcentaje = 0
 
-        # Mensaje tipo semáforo
+        if porcentaje < 0:
+            porcentaje = 0
+        if porcentaje > 100:
+            porcentaje = 100
+
+        # Mensaje tipo semáforo según porcentaje de COMPLETITUD
         if porcentaje >= 80:
-            resumen = "¡Excelente! Sigue así."
+            resumen = "¡Excelente! Has completado casi todos los ejercicios."
         elif porcentaje >= 50:
             resumen = "Vas bien, aún puedes mejorar."
+        elif porcentaje > 0:
+            resumen = "Estás avanzando, sigue practicando."
         else:
-            resumen = "Falta reforzar algunas competencias."
+            resumen = "Aún no has empezado a resolver ejercicios."
 
         return jsonify({
-            "ejerciciosDesarrollados": int(total),
+            "ejerciciosDesarrollados": int(resueltos),
             "nivelPorcentaje": porcentaje,
             "resumenTexto": resumen,
             "status": True
@@ -140,13 +152,15 @@ def resumen_progreso():
 
 # ==========================
 #  GET /progreso/por_competencia?idEstudiante=4
-#  Promedio por competencia MINEDU (0..100)
+#  Porcentaje de COMPLETITUD por competencia MINEDU (0..100)
 # ==========================
 @ws_progreso.route('/por_competencia', methods=['GET'])
 def progreso_por_competencia():
     """
-    Devuelve el promedio (0..100) por competencia del estudiante,
-    basado en la tabla PUNTAJES, agrupada por COMPETENCIAS.
+    Devuelve el porcentaje de ejercicios completados por competencia del estudiante,
+    basado en:
+      - ejercicios: total de ejercicios por competencia
+      - respuestas_estudiantes: ejercicios que el estudiante ya resolvió
 
     Respuesta:
     {
@@ -169,17 +183,22 @@ def progreso_por_competencia():
     cursor = con.cursor()
 
     try:
+        # Para cada competencia:
+        #   total = # ejercicios en esa competencia
+        #   resueltos = # ejercicios de esa competencia que el estudiante ha respondido
         cursor.execute("""
             SELECT
                 c.id_competencia,
                 c.descripcion,
-                AVG(p.puntaje) AS promedio
+                COUNT(DISTINCT e.id_ejercicio) AS total_ejercicios,
+                COUNT(DISTINCT r.id_ejercicio) AS resueltos
             FROM competencias c
-            LEFT JOIN puntajes p
-                   ON p.id_competencia = c.id_competencia
-                  AND p.id_estudiante = %s
-            -- Si quieres limitar a las 4 competencias MINEDU:
-            -- WHERE c.id_competencia BETWEEN 1 AND 4
+            LEFT JOIN ejercicios e
+                   ON e.id_competencia = c.id_competencia
+            LEFT JOIN respuestas_estudiantes r
+                   ON r.id_ejercicio = e.id_ejercicio
+                  AND r.id_estudiante = %s
+            WHERE c.id_competencia BETWEEN 1 AND 4
             GROUP BY c.id_competencia, c.descripcion
             ORDER BY c.id_competencia
         """, (id_estudiante,))
@@ -188,11 +207,18 @@ def progreso_por_competencia():
         temas = []
 
         for row in rows:
-            promedio = row.get("promedio")
-            if promedio is None:
-                pct = 0
+            total = row.get("total_ejercicios") or 0
+            resueltos = row.get("resueltos") or 0
+
+            if total > 0:
+                pct = int(round(100.0 * float(resueltos) / float(total)))
             else:
-                pct = int(round(promedio))
+                pct = 0
+
+            if pct < 0:
+                pct = 0
+            if pct > 100:
+                pct = 100
 
             temas.append({
                 "idCompetencia": row["id_competencia"],

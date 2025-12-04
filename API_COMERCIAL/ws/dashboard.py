@@ -8,10 +8,29 @@ ws_dashboard = Blueprint('ws_dashboard', __name__, url_prefix='/dashboard')
 
 @ws_dashboard.route('/mini/<int:id_estudiante>', methods=['GET'])
 def mini_dashboard(id_estudiante: int):
+    """
+    Mini dashboard para el estudiante.
+
+    Ahora usa la MISMA lógica que:
+      - /progreso/resumen  -> completitud global (ejercicios resueltos / totales)
+      - /progreso/por_competencia -> completitud por competencia
+
+    Respuesta:
+    {
+      "saludo": "Juan",
+      "progresoGeneral": 12,   # 0..100, completitud global
+      "promedio": 65,          # promedio de puntajes (0..100)
+      "temas": [
+        {"nombre": "Resuelve problemas de cantidad", "porcentaje": 0},
+        {"nombre": "Resuelve problemas de regularidad, equivalencia y cambio", "porcentaje": 10},
+        ...
+      ]
+    }
+    """
     con = Conexion()
     cur = con.cursor()
     try:
-        # 1) Saludo (nombre)
+        # 1) Saludo (nombre del estudiante)
         cur.execute("""
             SELECT u.nombre
             FROM usuarios u
@@ -23,40 +42,54 @@ def mini_dashboard(id_estudiante: int):
         saludo = (row and row.get('nombre')) or "Alumno"
 
         # 2) Progreso general (MISMA LÓGICA QUE /progreso/resumen)
-        #    Usamos Progreso.listar(id_estudiante) para contar cuántos
-        #    ejercicios están correctos sobre el total.
-        lista_json = Progreso.listar(id_estudiante)  # string JSON
-        payload = json.loads(lista_json)
+        #    completitud global: ejercicios resueltos / ejercicios totales (competencias 1..4)
+        cur.execute("""
+            SELECT
+                COUNT(DISTINCT e.id_ejercicio) AS total_ejercicios,
+                COUNT(DISTINCT r.id_ejercicio) AS resueltos
+            FROM ejercicios e
+            LEFT JOIN respuestas_estudiantes r
+                   ON r.id_ejercicio = e.id_ejercicio
+                  AND r.id_estudiante = %s
+            WHERE e.id_competencia BETWEEN 1 AND 4
+        """, (id_estudiante,))
+        row_total = cur.fetchone() or {}
+        total_ej = row_total.get("total_ejercicios", 0) or 0
+        resueltos = row_total.get("resueltos", 0) or 0
 
-        items = payload.get('data', []) if payload.get('status', False) else []
-        total = len(items)
-        correctas = sum(
-            1 for p in items
-            if str(p.get('estado', '')).lower().startswith('correcto')
-        )
-        progreso_general = int(round((correctas / total) * 100)) if total > 0 else 0
+        if total_ej > 0:
+            progreso_general = int(round(100.0 * float(resueltos) / float(total_ej)))
+        else:
+            progreso_general = 0
 
-        # 3) Promedio general de puntajes (0..100)
+        if progreso_general < 0:
+            progreso_general = 0
+        if progreso_general > 100:
+            progreso_general = 100
+
+        # 3) Promedio general de puntajes (0..100) - lo mantenemos como info extra
         cur.execute("""
             SELECT COALESCE(ROUND(AVG(puntaje)), 0)::int AS promedio
             FROM puntajes
             WHERE id_estudiante = %s
         """, (id_estudiante,))
-        row = cur.fetchone() or {}
-        promedio = row.get('promedio', 0) or 0
+        row_prom = cur.fetchone() or {}
+        promedio = row_prom.get('promedio', 0) or 0
 
         # 4) % por competencia (MISMA LÓGICA QUE /progreso/por_competencia)
         cur.execute("""
             SELECT
                 c.id_competencia,
                 c.descripcion,
-                AVG(p.puntaje) AS promedio
+                COUNT(DISTINCT e.id_ejercicio) AS total_ejercicios,
+                COUNT(DISTINCT r.id_ejercicio) AS resueltos
             FROM competencias c
-            LEFT JOIN puntajes p
-                   ON p.id_competencia = c.id_competencia
-                  AND p.id_estudiante = %s
-            -- Si quieres forzar solo las 4 competencias MINEDU, descomenta:
-            -- WHERE c.id_competencia BETWEEN 1 AND 4
+            LEFT JOIN ejercicios e
+                   ON e.id_competencia = c.id_competencia
+            LEFT JOIN respuestas_estudiantes r
+                   ON r.id_ejercicio = e.id_ejercicio
+                  AND r.id_estudiante = %s
+            WHERE c.id_competencia BETWEEN 1 AND 4
             GROUP BY c.id_competencia, c.descripcion
             ORDER BY c.id_competencia
         """, (id_estudiante,))
@@ -64,11 +97,19 @@ def mini_dashboard(id_estudiante: int):
 
         temas = []
         for r in temas_rows:
-            prom = r.get("promedio")
-            if prom is None:
-                pct = 0
+            total_comp = r.get("total_ejercicios") or 0
+            resueltos_comp = r.get("resueltos") or 0
+
+            if total_comp > 0:
+                pct = int(round(100.0 * float(resueltos_comp) / float(total_comp)))
             else:
-                pct = int(round(prom))
+                pct = 0
+
+            if pct < 0:
+                pct = 0
+            if pct > 100:
+                pct = 100
+
             temas.append({
                 "nombre": r["descripcion"],
                 "porcentaje": pct
@@ -76,10 +117,10 @@ def mini_dashboard(id_estudiante: int):
 
         return jsonify({
             "saludo": saludo,
-            "progresoGeneral": progreso_general,  # 👉 Este es el 44% que ves en "Mi Progreso"
+            "progresoGeneral": progreso_general,
             "promedio": int(promedio),
             "temas": temas
-        })
+        }), 200
 
     except Exception as e:
         return jsonify({
@@ -92,6 +133,7 @@ def mini_dashboard(id_estudiante: int):
     finally:
         cur.close()
         con.close()
+
 
 @ws_dashboard.route('/docente/<int:id_docente>', methods=['GET'])
 def dashboard_docente(id_docente: int):
@@ -210,8 +252,6 @@ def dashboard_docente(id_docente: int):
         actividad_reciente = []
         for r in rows_act:
             estado = (r.get("estado") or "").lower()
-            # Lo convertimos en un texto que encaje con:
-            # "<nombre> ha ${item.tipo} \"${item.tema}\""
             if estado.startswith("correcto"):
                 tipo_texto = "completado el tema"
             elif estado.startswith("incorrecto"):
@@ -226,7 +266,6 @@ def dashboard_docente(id_docente: int):
                 "fecha": r["fecha"].isoformat() if r.get("fecha") else None
             })
 
-        # RESPUESTA FINAL
         data = {
             "estudiantesActivos": estudiantes_activos,
             "progresoPromedio": progreso_promedio,
