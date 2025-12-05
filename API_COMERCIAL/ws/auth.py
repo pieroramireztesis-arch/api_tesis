@@ -33,22 +33,38 @@ def login():
     cur = con.cursor()
 
     try:
+        # 👇 JOIN con docente y estudiante para obtener sus IDs
         cur.execute("""
-            SELECT id_usuario, nombre, apellidos, correo, rol, contrasena
-            FROM usuarios 
-            WHERE correo=%s AND estado_usuario = 'activo'
+            SELECT 
+                u.id_usuario,
+                u.nombre,
+                u.apellidos,
+                u.correo,
+                u.rol,
+                d.id_docente,
+                e.id_estudiante,
+                u.contrasena
+            FROM usuarios u
+            LEFT JOIN docente   d ON d.id_usuario = u.id_usuario
+            LEFT JOIN estudiante e ON e.id_usuario = u.id_usuario
+            WHERE u.correo = %s
+              AND u.estado_usuario = 'activo'
         """, (correo,))
         row = cur.fetchone()
 
+        # row es dict: row['contrasena'], row['id_docente'], etc.
         if (not row) or (not row['contrasena']) or (not check_password_hash(row['contrasena'], password)):
             return jsonify({'status': False, 'message': 'Credenciales inválidas'}), 401
 
+        # 👇 Esto es lo que mapea directo a tu UserInfo en Android
         user = {
-            'id_usuario': row['id_usuario'],
-            'nombre': row['nombre'],
-            'apellidos': row['apellidos'],
-            'correo': row['correo'],
-            'rol': row['rol']
+            'id_usuario':   row['id_usuario'],
+            'nombre':       row['nombre'],
+            'apellidos':    row['apellidos'],
+            'correo':       row['correo'],
+            'rol':          row['rol'],
+            'id_docente':   row['id_docente'],    # puede ser None si es estudiante
+            'id_estudiante': row['id_estudiante'] # puede ser None si es docente
         }
 
         access_token = create_access_token(
@@ -62,7 +78,7 @@ def login():
         return jsonify({
             'status': True,
             'message': 'Inicio de sesión satisfactorio. Bienvenido al sistema',
-            'data': user,
+            'data': user,       # 👈 aquí viaja id_docente / id_estudiante
             'token': access_token
         }), 200
 
@@ -71,7 +87,6 @@ def login():
     finally:
         cur.close()
         con.close()
-
 
 # -------------------------------------------------------------------
 # REGISTRO

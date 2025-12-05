@@ -293,196 +293,193 @@ def ejercicio_siguiente():
     ajuste = request.args.get("ajuste", type=str)
 
     if not id_estudiante:
-        return (
-            jsonify({"error": "idEstudiante es obligatorio", "status": False}),
-            400,
-        )
+        return jsonify({"status": False, "error": "idEstudiante es obligatorio"}), 400
 
     con = Conexion()
     cursor = con.cursor()
 
     try:
-        where = []
+        # ===========================================================
+        # 1) Últimos 5 ejercicios respondidos → evitar repetición inmediata
+        # ===========================================================
+        cursor.execute("""
+            SELECT id_ejercicio
+            FROM respuestas_estudiantes
+            WHERE id_estudiante = %s
+            ORDER BY id_respuesta DESC
+            LIMIT 5
+        """, (id_estudiante,))
+        recientes = [r["id_ejercicio"] for r in cursor.fetchall()]
+
+        # ===========================================================
+        # 2) Ejercicios con 3 intentos incorrectos → NO repetir jamás
+        # ===========================================================
+        cursor.execute("""
+            SELECT r.id_ejercicio
+            FROM respuestas_estudiantes r
+            JOIN opciones_ejercicio o ON o.id_opcion = r.id_opcion
+            WHERE r.id_estudiante = %s
+            GROUP BY r.id_ejercicio
+            HAVING SUM(CASE WHEN o.es_correcta THEN 1 ELSE 0 END) = 0
+               AND COUNT(*) >= 3
+        """, (id_estudiante,))
+        bloqueados = [r["id_ejercicio"] for r in cursor.fetchall()]
+
+        # ===========================================================
+        # 3) Construir filtros de selección
+        # ===========================================================
+        filtros = []
         params = []
 
-        # filtro por dominio (competencia)
         if id_dominio:
-            where.append("e.id_competencia = %s")
+            filtros.append("e.id_competencia = %s")
             params.append(id_dominio)
 
-        # filtro por nivel según ajuste
-        if ajuste == "mas_dificil":
-            where.append("c.nivel >= 2")
-        elif ajuste == "mas_facil":
-            where.append("c.nivel = 1")
-
-        # no repetir ejercicios ya respondidos
-        where.append(
-            """
+        filtros.append("""
             NOT EXISTS(
                 SELECT 1
                 FROM respuestas_estudiantes r
+                JOIN opciones_ejercicio o ON o.id_opcion = r.id_opcion
                 WHERE r.id_ejercicio = e.id_ejercicio
                   AND r.id_estudiante = %s
+                  AND o.es_correcta = TRUE
             )
-        """
-        )
+        """)
         params.append(id_estudiante)
 
-        # solo ejercicios con opciones
-        where.append(
-            """
-            EXISTS(
-                SELECT 1
-                FROM opciones_ejercicio oe
-                WHERE oe.id_ejercicio = e.id_ejercicio
-            )
-        """
-        )
+        if recientes:
+            filtros.append("e.id_ejercicio NOT IN (" + ",".join(["%s"] * len(recientes)) + ")")
+            params.extend(recientes)
 
-        where_clause = " AND ".join(where)
-        if where_clause:
-            where_clause = "WHERE " + where_clause
+        if bloqueados:
+            filtros.append("e.id_ejercicio NOT IN (" + ",".join(["%s"] * len(bloqueados)) + ")")
+            params.extend(bloqueados)
 
-        sql_ejercicio = f"""
-            SELECT 
-                e.id_ejercicio,
-                e.descripcion      AS enunciado,
-                e.imagen_url       AS imagen_url,
-                c.id_competencia,
-                c.descripcion      AS competencia,
-                c.nivel
+        if ajuste == "mas_facil":
+            filtros.append("c.nivel <= 2")
+        elif ajuste == "mas_dificil":
+            filtros.append("c.nivel >= 3")
+
+        where = " AND ".join(filtros)
+        if where:
+            where = "WHERE " + where
+
+        # ===========================================================
+        # 4) Buscar ejercicio NUEVO (ideal)
+        # ===========================================================
+        cursor.execute(f"""
+            SELECT e.id_ejercicio,
+                   e.descripcion AS enunciado,
+                   e.imagen_url,
+                   c.id_competencia,
+                   c.descripcion AS competencia
             FROM ejercicios e
-            JOIN competencias c 
-              ON e.id_competencia = c.id_competencia
-            {where_clause}
+            JOIN competencias c ON c.id_competencia = e.id_competencia
+            {where}
             ORDER BY RANDOM()
             LIMIT 1
-        """
-        cursor.execute(sql_ejercicio, tuple(params))
+        """, tuple(params))
+
         ejercicio = cursor.fetchone()
 
+        # ===========================================================
+        # 5) Si NO hay ejercicios nuevos → permitir reforzar antiguos
+        # ===========================================================
         if not ejercicio:
-            return (
-                jsonify(
-                    {
-                        "status": False,
-                        "sinEjercicios": True,
-                        "mensaje": "No hay más ejercicios disponibles para este estudiante con los filtros dados.",
-                    }
-                ),
-                200,
-            )
+            cursor.execute("""
+                SELECT e.id_ejercicio, e.descripcion AS enunciado,
+                       e.imagen_url, c.id_competencia, c.descripcion AS competencia
+                FROM ejercicios e
+                JOIN competencias c ON c.id_competencia = e.id_competencia
+                WHERE e.id_ejercicio NOT IN (
+                    SELECT r.id_ejercicio
+                    FROM respuestas_estudiantes r
+                    JOIN opciones_ejercicio o ON o.id_opcion = r.id_opcion
+                    WHERE r.id_estudiante = %s
+                      AND o.es_correcta = TRUE
+                )
+                AND e.id_ejercicio NOT IN (
+                    SELECT id_ejercicio
+                    FROM respuestas_estudiantes
+                    WHERE id_estudiante = %s
+                    ORDER BY id_respuesta DESC
+                    LIMIT 5
+                )
+                ORDER BY RANDOM()
+                LIMIT 1
+            """, (id_estudiante, id_estudiante))
+
+            ejercicio = cursor.fetchone()
+
+            if not ejercicio:
+                return jsonify({
+                    "status": True,
+                    "sinEjercicios": True,
+                    "mensaje": "No hay más ejercicios disponibles. ¡Buen trabajo!"
+                })
 
         id_ejercicio = ejercicio["id_ejercicio"]
-        id_competencia = ejercicio["id_competencia"]
-        imagen_rel = ejercicio["imagen_url"]
 
-        # ================================
-        # Normalizar URL de la imagen
-        # Puede venir como:
-        #   - 'ejercicios_ayuda/ej_6.jpg'
-        #   - 'static/ejercicios_ayuda/ej_6.jpg'
-        #   - '/static/ejercicios_ayuda/ej_6.jpg'
-        #   - o ya una URL absoluta 'http://...'
-        # ================================
+        # ===========================================================
+        # 6) NORMALIZAR IMAGEN → SIEMPRE POR PUERTO 5000 (WEB_BASE_URL)
+        # ===========================================================
+        imagen_rel = ejercicio["imagen_url"]
+        imagen_url_abs = None
+
         if imagen_rel:
-            # Si ya es URL absoluta, la usamos tal cual
+            imagen_rel = imagen_rel.strip()
+
             if imagen_rel.startswith("http://") or imagen_rel.startswith("https://"):
                 imagen_url_abs = imagen_rel
             else:
-                # Asegurar que empiece por /static/...
-                # Quitamos espacios
-                imagen_rel = imagen_rel.strip()
-
-                # Si comienza por 'static/', le agregamos la barra inicial
+                # igual lógica que /tutor/sugerencias, pero usando WEB_BASE_URL
                 if imagen_rel.startswith("static/"):
                     imagen_rel = "/" + imagen_rel
 
-                # Si NO empieza por '/static/', asumimos que es solo la carpeta/archivo
                 if not imagen_rel.startswith("/static/"):
-                    # ejemplo: 'ejercicios_ayuda/ej_6.jpg' -> '/static/ejercicios_ayuda/ej_6.jpg'
                     if imagen_rel.startswith("/"):
                         imagen_rel = "/static" + imagen_rel
                     else:
                         imagen_rel = "/static/" + imagen_rel
 
-                # 🚨 Importante: las imágenes de ejercicios viven en el proyecto WEB (puerto 5000)
-                base = WEB_BASE_URL.rstrip("/")
+                base = WEB_BASE_URL.rstrip("/")        # 👈👈 AQUÍ EL CAMBIO CLAVE
                 imagen_url_abs = base + imagen_rel
 
-        else:
-            imagen_url_abs = None
-
-
-        # opciones
-        cursor.execute(
-            """
+        # ===========================================================
+        # 7) Cargar opciones del ejercicio
+        # ===========================================================
+        cursor.execute("""
             SELECT id_opcion, letra, descripcion
             FROM opciones_ejercicio
             WHERE id_ejercicio = %s
             ORDER BY letra
-        """,
-            (id_ejercicio,),
-        )
-        opciones_rows = cursor.fetchall()
-
-        if not opciones_rows:
-            return (
-                jsonify(
-                    {
-                        "status": False,
-                        "sinEjercicios": True,
-                        "mensaje": "El ejercicio seleccionado no tiene opciones registradas.",
-                    }
-                ),
-                200,
-            )
+        """, (id_ejercicio,))
 
         opciones = [
-            {
-                "idOpcion": o["id_opcion"],
-                "letra": o["letra"],
-                "texto": o["descripcion"],
-            }
-            for o in opciones_rows
+            {"idOpcion": o["id_opcion"], "letra": o["letra"], "texto": o["descripcion"]}
+            for o in cursor.fetchall()
         ]
 
-        # pista opcional
-        cursor.execute(
-            """
-            SELECT mensaje
-            FROM recomendaciones
-            WHERE id_ejercicio = %s
-            ORDER BY fecha DESC
-            LIMIT 1
-        """,
-            (id_ejercicio,),
-        )
-        rec = cursor.fetchone()
-        pista = rec["mensaje"] if rec else None
-
-        data = {
+        return jsonify({
             "status": True,
             "sinEjercicios": False,
-            "idEjercicio": id_ejercicio,
-            "idCompetencia": id_competencia,
+            "idEjercicio": ejercicio["id_ejercicio"],
+            "idCompetencia": ejercicio["id_competencia"],
             "enunciado": ejercicio["enunciado"],
             "imagenUrl": imagen_url_abs,
             "opciones": opciones,
-            "pista": pista,
-            "mensaje": None,
-            "requiereDesarrollo": True,
-        }
-
-        return jsonify(data), 200
+            "pista": None,
+            "requiereDesarrollo": False
+        })
 
     except Exception as e:
-        print("Error en /tutor/ejercicio_siguiente:", str(e))
-        return jsonify({"error": str(e), "status": False}), 500
+        print("ERROR en ejercicio_siguiente:", e)
+        return jsonify({"status": False, "error": str(e)}), 500
+
     finally:
         cursor.close()
         con.close()
+
 
 
 # =========================================
@@ -490,8 +487,11 @@ def ejercicio_siguiente():
 # =========================================
 def actualizar_progreso_estudiante(con, cursor, id_estudiante):
     """
-    Calcula el promedio de puntajes por competencia MINEDU y actualiza
-    la tabla ESTUDIANTE.
+    Calcula el progreso por competencia y general usando
+    LA MISMA LÓGICA que:
+      - /progreso/resumen   (API)
+      - /progreso/por_competencia (API)
+      - ws/reportes.reporte_progreso (WEB)
 
     Mapa de áreas -> columnas de la tabla estudiante:
       - 'cantidad'                        -> operaciones_basicas
@@ -500,36 +500,72 @@ def actualizar_progreso_estudiante(con, cursor, id_estudiante):
       - 'gestion_datos_incertidumbre'     -> geometria
     """
 
+    PESO_NUEVO = 1.0
+    PESO_REPETIDO = 0.30
+
+    # === Cálculo por competencia (igual que en ws_progreso / ws_reportes) ===
     cursor.execute(
         """
-        SELECT c.area,
-               AVG(p.puntaje) AS promedio
-        FROM puntajes p
-        JOIN competencias c ON c.id_competencia = p.id_competencia
-        WHERE p.id_estudiante = %s
-          AND c.area IS NOT NULL
-        GROUP BY c.area
+        SELECT
+            c.area,
+            COUNT(DISTINCT e.id_ejercicio) AS total,
+
+            COUNT(
+                DISTINCT CASE WHEN o.es_correcta = TRUE THEN r.id_ejercicio END
+            ) AS distintos_correctos,
+
+            COUNT(
+                CASE WHEN o.es_correcta = TRUE THEN 1 END
+            ) AS correctos_totales
+
+        FROM competencias c
+        LEFT JOIN ejercicios e
+            ON e.id_competencia = c.id_competencia
+        LEFT JOIN respuestas_estudiantes r
+            ON r.id_ejercicio = e.id_ejercicio
+           AND r.id_estudiante = %s
+        LEFT JOIN opciones_ejercicio o
+            ON o.id_opcion = r.id_opcion
+        WHERE c.id_competencia BETWEEN 1 AND 4
+        GROUP BY c.id_competencia, c.area
+        ORDER BY c.id_competencia
         """,
         (id_estudiante,),
     )
+
     rows = cursor.fetchall()
 
     cant = reg = forma = datos = None
 
     for row in rows:
         area = row["area"]
-        promedio = row["promedio"]
-        promedio_int = int(round(promedio)) if promedio is not None else None
+        total = row["total"] or 0
+        d_correctos = row["distintos_correctos"] or 0
+        t_correctos = row["correctos_totales"] or 0
+
+        repetidos = max(0, t_correctos - d_correctos)
+
+        if total > 0:
+            puntaje = (
+                d_correctos * PESO_NUEVO +
+                repetidos * PESO_REPETIDO
+            ) / float(total)
+        else:
+            puntaje = 0.0
+
+        porcentaje = int(round(puntaje * 100))
+        porcentaje = max(0, min(100, porcentaje))
 
         if area == "cantidad":
-            cant = promedio_int
+            cant = porcentaje
         elif area == "regularidad_equivalencia_cambio":
-            reg = promedio_int
+            reg = porcentaje
         elif area == "forma_movimiento_localizacion":
-            forma = promedio_int
+            forma = porcentaje
         elif area == "gestion_datos_incertidumbre":
-            datos = promedio_int
+            datos = porcentaje
 
+    # === Progreso general = promedio de las 4 competencias ===
     valores = [v for v in [cant, reg, forma, datos] if v is not None]
     progreso_general = int(round(sum(valores) / len(valores))) if valores else None
 
@@ -559,270 +595,283 @@ def responder():
     id_opcion_sel = data.get("idOpcionSeleccionada")
     tiempo_respuesta = data.get("tiempoRespuesta")
     uso_pista = bool(data.get("usoPista", False))
-    ajuste_anterior = data.get("ajuste")
+    ajuste_actual = data.get("ajuste")  # opcional
 
     if not id_estudiante or not id_ejercicio or not id_opcion_sel:
-        return jsonify({"error": "Faltan campos obligatorios"}), 400
+        return jsonify({"status": False, "error": "Faltan campos obligatorios"}), 400
 
     con = Conexion()
     cursor = con.cursor()
 
     try:
-        # 1) Verificar opción elegida
-        cursor.execute(
-            """
-            SELECT 
-                o.es_correcta, 
-                e.id_competencia,
-                c.nivel AS nivel_competencia
+        # ============================================================
+        # 1) Verificar opción seleccionada
+        # ============================================================
+        cursor.execute("""
+            SELECT o.es_correcta,
+                   e.id_competencia,
+                   c.nivel AS nivel_competencia
             FROM opciones_ejercicio o
             JOIN ejercicios e ON e.id_ejercicio = o.id_ejercicio
-            JOIN competencias c ON e.id_competencia = c.id_competencia
+            JOIN competencias c ON c.id_competencia = e.id_competencia
             WHERE o.id_opcion = %s
-        """,
-            (id_opcion_sel,),
-        )
+        """, (id_opcion_sel,))
+        
         row = cursor.fetchone()
-
         if not row:
-            return jsonify({"error": "Opción no encontrada"}), 404
+            return jsonify({"status": False, "error": "Opción no válida"}), 404
 
         es_correcta = bool(row["es_correcta"])
         id_competencia = row["id_competencia"]
         nivel_competencia = row["nivel_competencia"]
 
-        # 2) Registrar respuesta
-        cursor.execute(
-            """
+        # ============================================================
+        # 2) Registrar respuesta base
+        # ============================================================
+        cursor.execute("""
             INSERT INTO respuestas_estudiantes
                 (respuesta_texto, respuesta_imagen, fecha,
                  tiempo_respuesta, uso_pista,
-                 id_estudiante, id_ejercicio, id_opcion, desarrollo_url)
-            VALUES (%s, %s, CURRENT_TIMESTAMP,
-                    %s, %s,
-                    %s, %s, %s, %s)
+                 id_estudiante, id_ejercicio, id_opcion)
+            VALUES (%s, %s, NOW(), %s, %s, %s, %s, %s)
             RETURNING id_respuesta
-        """,
-            (
-                None,
-                None,
-                float(tiempo_respuesta) if tiempo_respuesta else None,
-                uso_pista,
-                id_estudiante,
-                id_ejercicio,
-                id_opcion_sel,
-                None,
-            ),
-        )
+        """, (
+            None,
+            None,
+            tiempo_respuesta,
+            uso_pista,
+            id_estudiante,
+            id_ejercicio,
+            id_opcion_sel
+        ))
         id_respuesta = cursor.fetchone()["id_respuesta"]
 
-        # 3) Puntaje simple (0 o 100)
+        # ============================================================
+        # 3) Registrar puntaje 0/100
+        # ============================================================
         puntaje = 100 if es_correcta else 0
-        cursor.execute(
-            """
-            INSERT INTO puntajes (puntaje, id_competencia, id_estudiante)
-            VALUES (%s, %s, %s)
-        """,
-            (puntaje, id_competencia, id_estudiante),
-        )
+        cursor.execute("""
+            INSERT INTO puntajes (puntaje, fecha_registro, id_competencia, id_estudiante)
+            VALUES (%s, NOW(), %s, %s)
+        """, (puntaje, id_competencia, id_estudiante))
 
+        # ============================================================
         # 4) Registrar progreso
-        nivel_actual_str = f"Nivel {nivel_competencia}" if nivel_competencia else None
+        # ============================================================
         estado = "correcto" if es_correcta else "incorrecto"
         if uso_pista:
             estado += "_con_pista"
 
-        cursor.execute(
-            """
+        cursor.execute("""
             INSERT INTO progreso
                 (nivel_actual, estado, tiempo_respuesta, id_estudiante, id_ejercicio)
             VALUES (%s, %s, %s, %s, %s)
-        """,
-            (
-                nivel_actual_str,
-                estado,
-                float(tiempo_respuesta) if tiempo_respuesta else None,
-                id_estudiante,
-                id_ejercicio,
-            ),
-        )
+        """, (
+            f"Nivel {nivel_competencia}",
+            estado,
+            tiempo_respuesta,
+            id_estudiante,
+            id_ejercicio
+        ))
 
-        # 5) Actualizar progreso general del estudiante (por áreas)
+        # Actualizar progreso general por competencias MINEDU
         actualizar_progreso_estudiante(con, cursor, id_estudiante)
 
-        # 6) Predicción con el modelo ML
-        nivel_ml_texto = None
-        nivel_competencia_int = None
-        nivel_global_texto = None
-
+        # ============================================================
+        # 5) ML → Intentar predecir nivel
+        # ============================================================
         try:
-            nivel_ml_texto = predecir_nivel_competencia(
-                cursor, id_estudiante, id_competencia
-            )
-        except Exception as e:
-            print("⚠️ Error en predecir_nivel_competencia:", e)
-            nivel_ml_texto = None
+            nivel_ml = predecir_nivel_competencia(cursor, id_estudiante, id_competencia)
+        except:
+            nivel_ml = None
 
-        # Intentar actualizar tabla nivel_estudiante_competencia;
-        # si algo falla, seguimos con la lógica por tiempo/pista.
-        if nivel_ml_texto is not None:
-            try:
-                nivel_competencia_int, nivel_global_texto = (
-                    actualizar_nivel_estudiante_competencia(
-                        cursor, id_estudiante, id_competencia, nivel_ml_texto
-                    )
-                )
+        # ============================================================
+        # 6) REGLA CTO: Reforzar incorrectos máximo 2 veces
+        # ============================================================
+        cursor.execute("""
+            SELECT COUNT(*)
+            FROM respuestas_estudiantes r
+            JOIN opciones_ejercicio o ON o.id_opcion = r.id_opcion
+            WHERE r.id_estudiante = %s
+              AND r.id_ejercicio = %s
+              AND o.es_correcta = FALSE
+        """, (id_estudiante, id_ejercicio))
+        
+        intentos_incorrectos = cursor.fetchone()["count"]
 
-                if nivel_ml_texto == "alto":
-                    nuevo_ajuste = "mas_dificil"
-                    mostrar_pista = False
-                    mensaje = "Vas muy bien, subimos un poco la dificultad."
-                elif nivel_ml_texto == "medio":
-                    nuevo_ajuste = "igual"
-                    mostrar_pista = uso_pista or not es_correcta
-                    mensaje = "Mantendremos el nivel actual y reforzaremos."
-                else:  # "bajo"
-                    nuevo_ajuste = "mas_facil"
-                    mostrar_pista = True
-                    mensaje = "Bajaremos un poco la dificultad para reforzar la competencia."
+        # ============================================================
+        # 7) Determinar ajuste final
+        # ============================================================
+        if not es_correcta and intentos_incorrectos < 2:
+            # 🔥 Reforzar dos veces máximo
+            nuevo_ajuste = "igual"
+            mostrar_pista = True
+            mensaje = "Vamos a reforzar este ejercicio una vez más."
 
-            except Exception as e:
-                print("⚠️ Error actualizando nivel_estudiante_competencia:", e)
-                nivel_ml_texto = None  # forzar uso de la lógica clásica
+        else:
+            # Ya no se refuerza → avanzamos con ML o fallback
+            if nivel_ml == "alto":
+                nuevo_ajuste = "mas_dificil"
+                mostrar_pista = False
+                mensaje = "Excelente, aumentaremos la dificultad."
 
-        if nivel_ml_texto is None:
-            # Fallback: lógica antigua basada en tiempo y pista
-            RAPIDO = 45
-            LENTO = 90
-            t = tiempo_respuesta or 0
+            elif nivel_ml == "medio":
+                nuevo_ajuste = "igual"
+                mostrar_pista = not es_correcta or uso_pista
+                mensaje = "Bien, continuamos reforzando este nivel."
 
-            if es_correcta:
-                if not uso_pista and t <= RAPIDO:
-                    nuevo_ajuste = "mas_dificil"
-                    mostrar_pista = False
-                    mensaje = "¡Excelente! Resolveremos algo más desafiante."
-                elif uso_pista or t > LENTO:
-                    nuevo_ajuste = "igual"
-                    mostrar_pista = False
-                    mensaje = "Muy bien, seguiremos con un nivel similar."
-                else:
-                    nuevo_ajuste = "mas_dificil"
-                    mostrar_pista = False
-                    mensaje = "Buen trabajo, aumentaremos la dificultad."
+            elif nivel_ml == "bajo":
+                nuevo_ajuste = "mas_facil"
+                mostrar_pista = True
+                mensaje = "Bajaremos un poco la dificultad para reforzar."
+
             else:
-                if uso_pista or t > LENTO:
-                    nuevo_ajuste = "mas_facil"
-                    mostrar_pista = True
-                    mensaje = "Veremos un ejercicio un poco más sencillo."
+                # Fallback sin ML
+                if es_correcta:
+                    nuevo_ajuste = "mas_dificil"
+                    mostrar_pista = False
+                    mensaje = "Perfecto, probemos algo más difícil."
                 else:
                     nuevo_ajuste = "igual"
                     mostrar_pista = True
-                    mensaje = "Intentemos un nivel similar con pista."
+                    mensaje = "Intentemos otro ejercicio similar."
+
         con.commit()
 
-        return jsonify(
-            {
-                "correcta": es_correcta,
-                "mostrarPista": mostrar_pista,
-                "mensaje": mensaje,
-                "nuevoAjuste": nuevo_ajuste,
-                "idRespuesta": id_respuesta,
-                "nivelMLCompetencia": nivel_ml_texto,
-                "nivelCompetenciaInt": nivel_competencia_int,
-                "nivelGlobal": nivel_global_texto,
-            }
-        ), 200
+        return jsonify({
+            "status": True,
+            "correcta": es_correcta,
+            "mostrarPista": mostrar_pista,
+            "nuevoAjuste": nuevo_ajuste,
+            "mensaje": mensaje,
+            "nivelML": nivel_ml,
+            "intentosIncorrectos": intentos_incorrectos,
+            "idRespuesta": id_respuesta
+        }), 200
 
     except Exception as e:
         con.rollback()
-        print("Error en /tutor/responder:", e)
-        return jsonify({"error": str(e)}), 500
+        print("ERROR en /tutor/responder:", e)
+        return jsonify({"status": False, "error": str(e)}), 500
+
     finally:
         cursor.close()
         con.close()
 
-
 # ============================================
-#  POST /tutor/subir_desarrollo
+#  POST /tutor/subir_desarrollo  (CTO VERSION FINAL)
 # ============================================
 @ws_tutor.route("/subir_desarrollo", methods=["POST"])
 def subir_desarrollo():
     print(">>> /tutor/subir_desarrollo: petición recibida")
 
+    # -------------------------
+    # 1) LEER CAMPOS DEL FORM
+    # -------------------------
     id_respuesta = request.form.get("idRespuesta", type=int)
     archivo = request.files.get("archivo")
 
-    print("   idRespuesta en form:", id_respuesta)
-    print("   archivos recibidos:", list(request.files.keys()))
+    print("   idRespuesta:", id_respuesta)
+    print("   archivo recibido:", archivo.filename if archivo else None)
 
-    if not id_respuesta or not archivo:
-        print("   Faltan datos, no se sube nada")
-        return (
-            jsonify(
-                {
-                    "status": False,
-                    "message": "idRespuesta y archivo son obligatorios",
-                }
-            ),
-            400,
-        )
+    if not id_respuesta:
+        return jsonify({
+            "status": False,
+            "message": "idRespuesta es obligatorio"
+        }), 400
 
-    ext = os.path.splitext(archivo.filename)[1].lower()
+    if not archivo:
+        return jsonify({
+            "status": False,
+            "message": "No se recibió archivo"
+        }), 400
+
+    # -------------------------
+    # 2) VALIDAR EXTENSIÓN
+    # -------------------------
+    nombre_original = archivo.filename
+    ext = os.path.splitext(nombre_original)[1].lower()
+
+    extensiones_permitidas = {".jpg", ".jpeg", ".png", ".pdf"}
+
+    if ext not in extensiones_permitidas:
+        return jsonify({
+            "status": False,
+            "message": f"Extensión no permitida ({ext}). Solo: JPG, PNG, PDF"
+        }), 400
+
+    # -------------------------
+    # 3) VALIDAR EXISTENCIA DE id_respuesta
+    # -------------------------
+    con = Conexion()
+    cursor = con.cursor()
+
+    cursor.execute("""
+        SELECT id_respuesta
+        FROM respuestas_estudiantes
+        WHERE id_respuesta = %s
+    """, (id_respuesta,))
+    row = cursor.fetchone()
+
+    if not row:
+        cursor.close()
+        con.close()
+        return jsonify({
+            "status": False,
+            "message": "La respuesta indicada no existe en la base de datos"
+        }), 404
+
+    # -------------------------
+    # 4) GENERAR NOMBRE SEGURO
+    # -------------------------
     filename = secure_filename(f"resp_{id_respuesta}{ext}")
     ruta_fisica = os.path.join(DESARROLLOS_FOLDER, filename)
-    print("   Guardando archivo en:", ruta_fisica)
+    ruta_rel = f"/static/desarrollos_alumno/{filename}"
+
+    print("   Guardando en:", ruta_fisica)
 
     try:
-        # Guarda el archivo en el disco
+        # -------------------------
+        # 5) GUARDAR ARCHIVO EN DISCO
+        # -------------------------
         archivo.save(ruta_fisica)
 
-        # Ruta relativa dentro del proyecto
-        ruta_relativa = f"/static/desarrollos_alumno/{filename}"
+        # -------------------------
+        # 6) GENERAR URL PÚBLICA REAL
+        # -------------------------
+        base = request.host_url.rstrip("/")  # ejemplo: http://192.168.1.13:3008
+        url_abs = base + ruta_rel
 
-        # URL absoluta con host + puerto del API
-        base = request.host_url.rstrip("/")
-        url_abs = base + ruta_relativa
+        print("   Archivo guardado correctamente. URL pública:", url_abs)
 
-        # Guarda la URL COMPLETA en la BD
-        con = Conexion()
-        cursor = con.cursor()
-        cursor.execute(
-            """
+        # -------------------------
+        # 7) ACTUALIZAR BD
+        # -------------------------
+        cursor.execute("""
             UPDATE respuestas_estudiantes
             SET desarrollo_url = %s
             WHERE id_respuesta = %s
-        """,
-            (url_abs, id_respuesta),
-        )
+        """, (url_abs, id_respuesta))
+
         con.commit()
-        cursor.close()
-        con.close()
 
-        print("   Archivo guardado OK. URL:", url_abs)
-
-        return (
-            jsonify(
-                {
-                    "status": True,
-                    "message": "Desarrollo subido correctamente",
-                    "desarrolloUrl": url_abs,
-                }
-            ),
-            200,
-        )
+        return jsonify({
+            "status": True,
+            "message": "Desarrollo subido correctamente",
+            "desarrolloUrl": url_abs
+        }), 200
 
     except Exception as e:
-        print("!! Error en /tutor/subir_desarrollo:", e)
-        return (
-            jsonify(
-                {
-                    "status": False,
-                    "message": str(e),
-                }
-            ),
-            500,
-        )
+        print("!! ERROR al guardar desarrollo:", e)
+        con.rollback()
+        return jsonify({
+            "status": False,
+            "message": f"Error al guardar el archivo: {str(e)}"
+        }), 500
 
+    finally:
+        cursor.close()
+        con.close()
 
 # ================================
 #  GET /tutor/nivel_actual
@@ -926,13 +975,17 @@ def sugerencias_ejercicios(id_estudiante: int, id_competencia: int):
               AND NOT EXISTS (
                     SELECT 1
                     FROM respuestas_estudiantes r
+                    JOIN opciones_ejercicio o
+                      ON o.id_opcion = r.id_opcion
                     WHERE r.id_ejercicio = e.id_ejercicio
                       AND r.id_estudiante = %s
+                      AND o.es_correcta = TRUE
               )
               {filtro_nivel}
             ORDER BY RANDOM()
             LIMIT %s
         """
+
         cursor.execute(sql, (id_competencia, id_estudiante, limite))
         ejercicios = cursor.fetchall()
 
