@@ -22,5 +22,4 @@ class SecretKey:
 
 
 class Host:
-    # Para que otras partes sepan dónde corre la API
     URL_APP = os.getenv("URL_APP", "http://127.0.0.1:3008/")

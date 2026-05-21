@@ -8,74 +8,52 @@ ws_progreso = Blueprint('ws_progreso', __name__, url_prefix='/progreso')
 
 # ==========================
 #  POST /progreso
-#  Registrar progreso
 # ==========================
 @ws_progreso.route('', methods=['POST'])
 def registrar_progreso():
     try:
         data = request.get_json(force=True)
-
-        id_estudiante = data.get('id_estudiante')
-        id_ejercicio = data.get('id_ejercicio')
-        nivel_actual = data.get('nivel_actual')
-        estado = data.get('estado')
+        id_estudiante    = data.get('id_estudiante')
+        id_ejercicio     = data.get('id_ejercicio')
+        nivel_actual     = data.get('nivel_actual')
+        estado           = data.get('estado')
         tiempo_respuesta = data.get('tiempo_respuesta')
 
-        # Validación más clara (sin usar all con un boolean dentro)
-        if id_estudiante is None or id_ejercicio is None or nivel_actual is None or estado is None:
+        if id_estudiante is None or id_ejercicio is None \
+                or nivel_actual is None or estado is None:
             return jsonify({
                 "status": False,
                 "mensaje": "Faltan campos obligatorios"
             }), 400
 
         resp = Progreso.registrar(
-            id_estudiante,
-            id_ejercicio,
-            nivel_actual,
-            estado,
-            tiempo_respuesta
+            id_estudiante, id_ejercicio,
+            nivel_actual, estado, tiempo_respuesta
         )
         return jsonify(json.loads(resp))
 
     except Exception as e:
-        return jsonify({
-            "status": False,
-            "mensaje": str(e)
-        }), 500
+        return jsonify({"status": False, "mensaje": str(e)}), 500
 
 
 # ==========================
 #  GET /progreso
-#  Listar todos
 # ==========================
 @ws_progreso.route('', methods=['GET'])
 def listar_progreso():
     try:
         return jsonify(json.loads(Progreso.listar_todos()))
     except Exception as e:
-        return jsonify({
-            "status": False,
-            "mensaje": str(e)
-        }), 500
+        return jsonify({"status": False, "mensaje": str(e)}), 500
+
 
 # ==========================
 #  GET /progreso/resumen?idEstudiante=4
-#  Resumen simple: % global + #ejercicios (basado en PUNTAJES)
+#  ✅ Cuenta ejercicios de TODOS los modos
+#  ✅ Lecciones desde historial_material_estudio (nombre correcto)
 # ==========================
 @ws_progreso.route('/resumen', methods=['GET'])
 def resumen_progreso():
-    """
-    Parámetro:
-      - idEstudiante (query) -> obligatorio
-
-    Respuesta:
-      {
-        "ejerciciosDesarrollados": int,
-        "nivelPorcentaje": int,   # promedio de puntajes 0..100
-        "resumenTexto": str,
-        "status": true/false
-      }
-    """
     id_estudiante = request.args.get('idEstudiante', type=int)
     if not id_estudiante:
         return jsonify({
@@ -85,53 +63,75 @@ def resumen_progreso():
 
     con = Conexion()
     cur = con.cursor()
-
     try:
-        # Usamos la misma fuente que /por_competencia: tabla PUNTAJES
+        # Total ejercicios desarrollados (todos los modos)
         cur.execute("""
-            SELECT
-                COUNT(*)        AS total_ej,
-                AVG(puntaje)    AS promedio
-            FROM puntajes
+            SELECT COUNT(*) AS total_ej
+            FROM progreso
             WHERE id_estudiante = %s
         """, (id_estudiante,))
+        row_total = cur.fetchone() or {}
+        total = int(row_total.get("total_ej", 0) or 0)
 
-        row = cur.fetchone() or {}
-        total = row.get("total_ej", 0) or 0
-        promedio = row.get("promedio", None)
+        # ✅ CORREGIDO: nombre real de la tabla es historial_material_estudio
+        cur.execute("""
+            SELECT COUNT(DISTINCT id_material) AS total_mat
+            FROM historial_material_estudio
+            WHERE id_estudiante = %s
+        """, (id_estudiante,))
+        row_mat = cur.fetchone() or {}
+        total_lecciones = int(row_mat.get("total_mat", 0) or 0)
 
-        if promedio is None:
-            porcentaje = 0
-        else:
-            porcentaje = int(round(float(promedio)))
-            if porcentaje < 0:
-                porcentaje = 0
-            if porcentaje > 100:
-                porcentaje = 100
+        # Promedio por competencia (todas las 4 MINEDU)
+        cur.execute("""
+            SELECT
+                c.id_competencia,
+                AVG(p.puntaje) AS promedio
+            FROM competencias c
+            LEFT JOIN puntajes p
+                   ON p.id_competencia = c.id_competencia
+                  AND p.id_estudiante  = %s
+            WHERE c.id_competencia BETWEEN 1 AND 4
+            GROUP BY c.id_competencia
+            ORDER BY c.id_competencia
+        """, (id_estudiante,))
 
-        # Mensaje tipo semáforo
+        rows_comp = cur.fetchall() or []
+        suma = 0
+        for row in rows_comp:
+            prom = row.get("promedio")
+            if prom is not None:
+                suma += float(prom)
+        porcentaje = max(0, min(100, int(round(suma / 4))))
+
         if porcentaje >= 80:
-            resumen = "¡Excelente! Sigue así."
-        elif porcentaje >= 50:
+            resumen = "¡Excelente! Dominas todas las competencias."
+        elif porcentaje >= 60:
+            resumen = "¡Muy bien! Sigue practicando."
+        elif porcentaje >= 40:
             resumen = "Vas bien, aún puedes mejorar."
-        else:
+        elif porcentaje > 0:
             resumen = "Falta reforzar algunas competencias."
+        else:
+            resumen = "¡Empieza a practicar para ver tu progreso!"
 
         return jsonify({
-            "ejerciciosDesarrollados": int(total),
-            "nivelPorcentaje": porcentaje,
-            "resumenTexto": resumen,
-            "status": True
+            "ejerciciosDesarrollados": total,
+            "leccionesVistas":         total_lecciones,
+            "nivelPorcentaje":         porcentaje,
+            "resumenTexto":            resumen,
+            "status":                  True
         }), 200
 
     except Exception as e:
         print("Error en /progreso/resumen:", str(e))
         return jsonify({
             "ejerciciosDesarrollados": 0,
-            "nivelPorcentaje": 0,
-            "resumenTexto": "Error al calcular el progreso.",
-            "status": False,
-            "mensaje": str(e)
+            "leccionesVistas":         0,
+            "nivelPorcentaje":         0,
+            "resumenTexto":            "Error al calcular el progreso.",
+            "status":                  False,
+            "mensaje":                 str(e)
         }), 500
     finally:
         cur.close()
@@ -140,24 +140,10 @@ def resumen_progreso():
 
 # ==========================
 #  GET /progreso/por_competencia?idEstudiante=4
-#  Promedio por competencia MINEDU (0..100)
+#  ✅ Usa todos los puntajes (repaso + evaluación)
 # ==========================
 @ws_progreso.route('/por_competencia', methods=['GET'])
 def progreso_por_competencia():
-    """
-    Devuelve el promedio (0..100) por competencia del estudiante,
-    basado en la tabla PUNTAJES, agrupada por COMPETENCIAS.
-
-    Respuesta:
-    {
-      "status": true,
-      "temas": [
-        {"idCompetencia": 1, "nombre": "Resuelve problemas de cantidad", "porcentaje": 60},
-        {"idCompetencia": 2, "nombre": "Resuelve problemas de regularidad, equivalencia y cambio", "porcentaje": 40},
-        ...
-      ]
-    }
-    """
     id_estudiante = request.args.get('idEstudiante', type=int)
     if not id_estudiante:
         return jsonify({
@@ -165,81 +151,77 @@ def progreso_por_competencia():
             "mensaje": "idEstudiante es obligatorio"
         }), 400
 
-    con = Conexion()
+    con    = Conexion()
     cursor = con.cursor()
-
     try:
+        # porcentaje = ((nivel_actual-1)/6)*70  +  (promedio_puntaje/100)*30
         cursor.execute("""
             SELECT
                 c.id_competencia,
                 c.descripcion,
-                AVG(p.puntaje) AS promedio
+                COALESCE(nec.nivel_actual, 0)  AS nivel_actual,
+                COALESCE(AVG(p.puntaje), 0)    AS promedio_puntaje
             FROM competencias c
             LEFT JOIN puntajes p
                    ON p.id_competencia = c.id_competencia
-                  AND p.id_estudiante = %s
-            -- Si quieres limitar a las 4 competencias MINEDU:
-            -- WHERE c.id_competencia BETWEEN 1 AND 4
-            GROUP BY c.id_competencia, c.descripcion
+                  AND p.id_estudiante  = %s
+            LEFT JOIN nivel_estudiante_competencia nec
+                   ON nec.id_competencia = c.id_competencia
+                  AND nec.id_estudiante  = %s
+            WHERE c.id_competencia BETWEEN 1 AND 4
+            GROUP BY c.id_competencia, c.descripcion, nec.nivel_actual
             ORDER BY c.id_competencia
-        """, (id_estudiante,))
+        """, (id_estudiante, id_estudiante))
 
-        rows = cursor.fetchall() or []
+        rows  = cursor.fetchall() or []
         temas = []
-
         for row in rows:
-            promedio = row.get("promedio")
-            if promedio is None:
-                pct = 0
-            else:
-                pct = int(round(promedio))
+            nivel_actual     = int(row.get("nivel_actual") or 0)
+            promedio_puntaje = float(row.get("promedio_puntaje") or 0)
+
+            pct = max(0, min(100, int(round((nivel_actual / 7) * 100))))
+
+            nombre_nivel = {
+                0: "Sin iniciar",
+                1: "Iniciando",
+                2: "Básico",
+                3: "En progreso",
+                4: "Intermedio",
+                5: "Avanzado",
+                6: "Casi experto",
+                7: "Dominio completo"
+            }.get(nivel_actual, "Sin datos")
 
             temas.append({
-                "idCompetencia": row["id_competencia"],
-                "nombre": row["descripcion"],
-                "porcentaje": pct
+                "idCompetencia":   row["id_competencia"],
+                "nombre":          row["descripcion"],
+                "porcentaje":      pct,
+                "nivelActual":     nivel_actual,
+                "nombreNivel":     nombre_nivel,
+                "promedioPuntaje": int(round(promedio_puntaje))
             })
 
-        return jsonify({
-            "status": True,
-            "temas": temas
-        }), 200
+        return jsonify({"status": True, "temas": temas}), 200
 
     except Exception as e:
         print("Error en /progreso/por_competencia:", str(e))
-        return jsonify({
-            "status": False,
-            "mensaje": str(e)
-        }), 500
+        return jsonify({"status": False, "mensaje": str(e)}), 500
     finally:
         cursor.close()
         con.close()
 
 
 # ==========================
-#  GET /progreso/historial?idEstudiante=4
-#  Últimas 3 actividades del estudiante
+#  GET /progreso/historial?idEstudiante=4&limite=5&offset=0
+#  ✅ Devuelve modo en cada item
+#  ✅ Soporta paginación
 # ==========================
 @ws_progreso.route('/historial', methods=['GET'])
 def historial_progreso():
-    """
-    Devuelve las últimas 3 actividades del estudiante.
-
-    Respuesta:
-    {
-      "status": true,
-      "items": [
-        {
-          "idProgreso": 10,
-          "idEjercicio": 5,
-          "titulo": "Ejercicio: Simplificar polinomios",
-          "subtitulo": "Resultado: correcto"
-        },
-        ...
-      ]
-    }
-    """
     id_estudiante = request.args.get('idEstudiante', type=int)
+    limite        = request.args.get('limite', default=5, type=int)
+    offset        = request.args.get('offset', default=0, type=int)
+
     if not id_estudiante:
         return jsonify({
             "status": False,
@@ -248,51 +230,114 @@ def historial_progreso():
 
     con = Conexion()
     cur = con.cursor()
-
     try:
+        # Total de registros para saber si hay más
+        cur.execute("""
+            SELECT COUNT(*) AS total
+            FROM progreso
+            WHERE id_estudiante = %s
+        """, (id_estudiante,))
+        total_registros = int((cur.fetchone() or {}).get("total", 0) or 0)
+
         cur.execute("""
             SELECT
                 p.id_progreso,
                 p.id_ejercicio,
-                e.descripcion     AS ejercicio,
-                p.estado
+                p.estado,
+                p.fecha,
+                p.modo,
+                e.descripcion AS ejercicio,
+                e.id_competencia,
+                r2.desarrollo_url,
+                COUNT(
+                    CASE WHEN r.id_opcion IS NOT NULL
+                         AND op.es_correcta = FALSE
+                         THEN 1 END
+                ) AS intentos_incorrectos
             FROM progreso p
-            JOIN ejercicios e ON e.id_ejercicio = p.id_ejercicio
+            JOIN ejercicios e
+                ON e.id_ejercicio = p.id_ejercicio
+            LEFT JOIN respuestas_estudiantes r
+                ON r.id_estudiante = p.id_estudiante
+               AND r.id_ejercicio  = p.id_ejercicio
+            LEFT JOIN opciones_ejercicio op
+                ON op.id_opcion = r.id_opcion
+            LEFT JOIN respuestas_estudiantes r2
+                ON r2.id_estudiante = p.id_estudiante
+               AND r2.id_ejercicio  = p.id_ejercicio
+               AND r2.desarrollo_url IS NOT NULL
+               AND r2.id_respuesta = (
+                   SELECT r3.id_respuesta
+                   FROM respuestas_estudiantes r3
+                   WHERE r3.id_estudiante = p.id_estudiante
+                     AND r3.id_ejercicio  = p.id_ejercicio
+                     AND r3.fecha <= p.fecha
+                   ORDER BY r3.id_respuesta DESC
+                   LIMIT 1
+               )
             WHERE p.id_estudiante = %s
+            GROUP BY
+                p.id_progreso,
+                p.id_ejercicio,
+                p.estado,
+                p.fecha,
+                p.modo,
+                e.descripcion,
+                e.id_competencia,
+                r2.desarrollo_url
             ORDER BY p.id_progreso DESC
-            LIMIT 3
-        """, (id_estudiante,))
+            LIMIT %s OFFSET %s
+        """, (id_estudiante, limite, offset))
 
-        rows = cur.fetchall() or []
+        rows  = cur.fetchall() or []
         items = []
 
         for r in rows:
-            estado = (r.get("estado") or "").strip().lower()
-            if estado.startswith("correcto"):
-                subtitulo = "Resultado: correcto"
-            elif estado.startswith("incorrecto"):
-                subtitulo = "Resultado: incorrecto"
+            estado_raw = (r.get("estado") or "").strip().lower()
+            modo_raw   = (r.get("modo")   or "repaso").strip().lower()
+
+            if estado_raw.startswith("correcto"):
+                estado_texto = "Correcto ✅"
+            elif estado_raw.startswith("incorrecto"):
+                estado_texto = "Incorrecto ❌"
             else:
-                subtitulo = f"Estado: {r.get('estado') or 'sin datos'}"
+                estado_texto = r.get("estado") or "Sin datos"
+
+            if modo_raw == "evaluacion":
+                modo_texto = "Evaluación"
+            else:
+                modo_texto = "Revisión"
+
+            fecha_raw = r.get("fecha")
+            fecha_str = str(fecha_raw).replace(" ", "T")[:19] if fecha_raw else ""
+            intentos  = int(r.get("intentos_incorrectos") or 0)
 
             items.append({
-                "idProgreso": r["id_progreso"],
-                "idEjercicio": r["id_ejercicio"],
-                "titulo": f"Ejercicio: {r['ejercicio']}",
-                "subtitulo": subtitulo
+                "idProgreso":          r["id_progreso"],
+                "idEjercicio":         r["id_ejercicio"],
+                "idCompetencia":       r.get("id_competencia") or 0,
+                "desarrolloUrl":       r.get("desarrollo_url") or None,
+                "titulo":              f"Ejercicio: {r['ejercicio']}",
+                "fecha":               fecha_str,
+                "estado":              estado_texto,
+                "modo":                modo_texto,
+                "intentosIncorrectos": intentos
             })
 
+        hay_mas = (offset + limite) < total_registros
+
         return jsonify({
-            "status": True,
-            "items": items
+            "status":   True,
+            "items":    items,
+            "total":    total_registros,
+            "hayMas":   hay_mas,
+            "offset":   offset,
+            "limite":   limite
         }), 200
 
     except Exception as e:
         print("Error en /progreso/historial:", str(e))
-        return jsonify({
-            "status": False,
-            "mensaje": str(e)
-        }), 500
+        return jsonify({"status": False, "mensaje": str(e)}), 500
     finally:
         cur.close()
         con.close()
@@ -306,7 +351,4 @@ def eliminar_progreso(id_progreso):
     try:
         return jsonify(json.loads(Progreso.eliminar(id_progreso)))
     except Exception as e:
-        return jsonify({
-            "status": False,
-            "mensaje": str(e)
-        }), 500
+        return jsonify({"status": False, "mensaje": str(e)}), 500

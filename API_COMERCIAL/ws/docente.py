@@ -1,9 +1,10 @@
-# ws/docente.py
 from flask import Blueprint, request, jsonify
 from models.Docente import Docente
+from conexionBD import Conexion
 import json
 
 ws_docente = Blueprint('ws_docente', __name__)
+
 
 # ========================================
 # CRUD BÁSICO DE DOCENTES
@@ -50,3 +51,223 @@ def eliminar_docente(id_docente):
 @ws_docente.route('/docentes/<int:id_docente>/dashboard', methods=['GET'])
 def docentes_dashboard(id_docente):
     return jsonify(json.loads(Docente.dashboard(id_docente)))
+
+
+# ========================================
+# ✅ NUEVO: LISTAR ESTUDIANTES DEL DOCENTE
+# GET /docentes/<id_docente>/estudiantes
+# Devuelve nombre en formato "Apellidos, Nombre"
+# ========================================
+
+@ws_docente.route('/docentes/<int:id_docente>/estudiantes', methods=['GET'])
+def docentes_estudiantes(id_docente):
+    """
+    Lista todos los estudiantes asignados al salón del docente.
+    El nombre se devuelve como: "Apellidos, Nombre"
+    para que en la app aparezca ordenado correctamente.
+
+    Respuesta:
+    {
+      "status": true,
+      "data": [
+        {
+          "id_estudiante": 3,
+          "nombre": "Chávez Díaz, Carlos",
+          "progreso": 12
+        },
+        ...
+      ]
+    }
+    """
+    con = Conexion()
+    cur = con.cursor()
+
+    try:
+        # Buscamos los estudiantes vinculados al salón del docente
+        # y calculamos su progreso general como promedio de las 4 competencias
+        cur.execute("""
+            SELECT DISTINCT
+                e.id_estudiante,
+                -- ✅ Formato: "Apellidos, Nombre"
+                TRIM(u.apellidos) || ', ' || TRIM(u.nombre)  AS nombre,
+                COALESCE(
+                    (
+                        SELECT ROUND(AVG(sub.promedio_comp))
+                        FROM (
+                            SELECT AVG(p.puntaje) AS promedio_comp
+                            FROM puntajes p
+                            WHERE p.id_estudiante = e.id_estudiante
+                              AND p.id_competencia BETWEEN 1 AND 4
+                            GROUP BY p.id_competencia
+                        ) sub
+                    ),
+                    0
+                ) AS progreso
+            FROM estudiante e
+            JOIN usuarios u
+                ON u.id_usuario = e.id_usuario
+            JOIN estudiante_salones es
+                ON es.id_estudiante = e.id_estudiante
+            JOIN salones s
+                ON s.id_salon = es.id_salon
+            JOIN docente_salones ds
+                ON ds.id_salon = s.id_salon
+            WHERE ds.id_docente = %s
+              AND e.estado_estudiante = 'activo'
+            ORDER BY nombre
+        """, (id_docente,))
+
+        rows = cur.fetchall() or []
+
+        data = [
+            {
+                "id_estudiante": row["id_estudiante"],
+                "nombre":        row["nombre"],
+                "progreso":      int(row["progreso"] or 0)
+            }
+            for row in rows
+        ]
+
+        return jsonify({
+            "status": True,
+            "data":   data
+        }), 200
+
+    except Exception as e:
+        print("Error en /docentes/estudiantes:", str(e))
+        return jsonify({
+            "status":  False,
+            "message": str(e)
+        }), 500
+    finally:
+        cur.close()
+        con.close()
+
+
+# ========================================
+# ALERTAS DEL DOCENTE
+# GET /docentes/<id_docente>/alertas
+# Devuelve alumnos críticos:
+#   - promedio < 40 en alguna competencia (nivel bajo)
+#   - o >= 3 de sus últimas 5 respuestas fueron incorrectas
+# ========================================
+
+@ws_docente.route('/docentes/<int:id_docente>/alertas', methods=['GET'])
+def docentes_alertas(id_docente):
+    con = Conexion()
+    cur = con.cursor()
+
+    try:
+        # 1) Todos los estudiantes activos del docente
+        cur.execute("""
+            SELECT DISTINCT
+                e.id_estudiante,
+                TRIM(u.apellidos) || ', ' || TRIM(u.nombre) AS nombre
+            FROM estudiante e
+            JOIN usuarios u         ON u.id_usuario    = e.id_usuario
+            JOIN estudiante_salones es ON es.id_estudiante = e.id_estudiante
+            JOIN salones s          ON s.id_salon       = es.id_salon
+            JOIN docente_salones ds ON ds.id_salon      = s.id_salon
+            WHERE ds.id_docente = %s
+              AND e.estado_estudiante = 'activo'
+            ORDER BY nombre
+        """, (id_docente,))
+        estudiantes = cur.fetchall() or []
+
+        if not estudiantes:
+            return jsonify({"status": True, "data": []}), 200
+
+        ids_est = [e["id_estudiante"] for e in estudiantes]
+        nombres = {e["id_estudiante"]: e["nombre"] for e in estudiantes}
+
+        # 2) Promedio por competencia por alumno (una sola query)
+        cur.execute("""
+            SELECT
+                e.id_estudiante,
+                c.id_competencia,
+                c.descripcion,
+                COALESCE(AVG(p.puntaje), -1) AS promedio
+            FROM estudiante e
+            CROSS JOIN competencias c
+            LEFT JOIN puntajes p
+                   ON p.id_estudiante  = e.id_estudiante
+                  AND p.id_competencia = c.id_competencia
+            WHERE e.id_estudiante = ANY(%s)
+              AND c.id_competencia BETWEEN 1 AND 4
+            GROUP BY e.id_estudiante, c.id_competencia, c.descripcion
+            ORDER BY e.id_estudiante, c.id_competencia
+        """, (ids_est,))
+        comp_rows = cur.fetchall() or []
+
+        # 3) Errores recientes — últimas 5 respuestas por alumno
+        cur.execute("""
+            SELECT
+                id_estudiante,
+                COUNT(*) AS incorrectas,
+                MAX(fecha) AS ultima_actividad
+            FROM (
+                SELECT
+                    id_estudiante,
+                    estado,
+                    fecha,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY id_estudiante ORDER BY fecha DESC
+                    ) AS rn
+                FROM progreso
+                WHERE id_estudiante = ANY(%s)
+            ) sub
+            WHERE rn <= 5
+              AND estado ILIKE 'incorrecto%%'
+            GROUP BY id_estudiante
+        """, (ids_est,))
+        errores_map = {
+            r["id_estudiante"]: {
+                "incorrectas":      int(r["incorrectas"] or 0),
+                "ultima_actividad": r["ultima_actividad"].strftime("%d/%m/%Y")
+                                    if r["ultima_actividad"] else "Sin actividad"
+            }
+            for r in (cur.fetchall() or [])
+        }
+
+        # 4) Agrupar competencias con problema por alumno
+        comp_map = {}
+        for r in comp_rows:
+            id_est = r["id_estudiante"]
+            prom   = r.get("promedio")
+            if prom is not None and float(prom) >= 0 and float(prom) < 40:
+                comp_map.setdefault(id_est, []).append({
+                    "idCompetencia": r["id_competencia"],
+                    "nombre":        r["descripcion"],
+                    "promedio":      int(round(float(prom))),
+                    "nivel":         "bajo"
+                })
+
+        # 5) Construir lista de alertas
+        alertas = []
+        for id_est in ids_est:
+            comps_problema  = comp_map.get(id_est, [])
+            err_data        = errores_map.get(id_est, {"incorrectas": 0, "ultima_actividad": "Sin actividad"})
+            incorrectas     = err_data["incorrectas"]
+            ultima_actividad = err_data["ultima_actividad"]
+
+            if not comps_problema and incorrectas < 3:
+                continue
+
+            tipo = "bajo_rendimiento" if comps_problema else "muchos_errores"
+            alertas.append({
+                "id_estudiante":        id_est,
+                "nombre":               nombres[id_est],
+                "tipoAlerta":           tipo,
+                "competenciasProblema": comps_problema,
+                "erroresRecientes":     incorrectas,
+                "ultimaActividad":      ultima_actividad,
+            })
+
+        return jsonify({"status": True, "data": alertas}), 200
+
+    except Exception as e:
+        print("Error en /docentes/alertas:", str(e))
+        return jsonify({"status": False, "message": str(e)}), 500
+    finally:
+        cur.close()
+        con.close()

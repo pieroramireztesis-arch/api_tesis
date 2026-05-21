@@ -195,8 +195,15 @@ class Docente:
 
             actividad = []
             for f in filas:
+                estado_f = (f.get("estado") or "").lower()
+                if estado_f.startswith("correcto"):
+                    tipo_f = "completado"
+                elif estado_f.startswith("incorrecto"):
+                    tipo_f = "intentado"
+                else:
+                    tipo_f = "progreso"
                 actividad.append({
-                    "tipo": "completado" if f["estado"] == "completado" else "progreso",
+                    "tipo": tipo_f,
                     "nombreEstudiante": f"{f['nombre']} {f['apellidos']}",
                     "tema": f["tema"],
                     "fecha": f["fecha"].isoformat() if f["fecha"] else None

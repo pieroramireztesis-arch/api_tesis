@@ -2,6 +2,13 @@
 from flask import Blueprint, jsonify, request
 from conexionBD import Conexion
 import json
+import os
+
+
+def _imagen_url(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    return "/ejercicios/imagen/" + os.path.basename(raw)
 
 ws_ejercicio = Blueprint("ws_ejercicio", __name__, url_prefix="/ejercicios")
 
@@ -44,7 +51,7 @@ def listar_ejercicios():
             {
                 "idEjercicio": r["id_ejercicio"],
                 "enunciado": r["descripcion"],
-                "imagenUrl": r["imagen_url"],
+                "imagenUrl": _imagen_url(r["imagen_url"]),
                 "respuestaCorrecta": r["respuesta_correcta"],
                 "pista": r["pista"],
                 "idCompetencia": r["id_competencia"],

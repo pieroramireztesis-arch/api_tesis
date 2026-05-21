@@ -1,4 +1,4 @@
-from flask import Flask
+from flask import Flask, send_from_directory
 from flask_jwt_extended import JWTManager
 
 # 👇 AGREGAR ESTO JUSTO AQUÍ
@@ -57,6 +57,21 @@ app.register_blueprint(ws_tutor)
 app.register_blueprint(ws_dashboard)
 app.register_blueprint(ws_auth)
 app.register_blueprint(ws_dominio)
+
+
+_EJERCICIOS_AYUDA = os.getenv(
+    "EJERCICIOS_AYUDA_PATH",
+    r"C:\Users\JUAN RAMIREZ\Desktop\proyecto_tesis_web\static\ejercicios_ayuda"
+)
+print("📁 Ruta imágenes:", _EJERCICIOS_AYUDA)
+print("📁 ¿Existe?:", os.path.exists(_EJERCICIOS_AYUDA))
+
+@app.route('/ejercicios/imagen/<filename>')
+def servir_imagen_ejercicio(filename):
+    response = send_from_directory(_EJERCICIOS_AYUDA, filename)
+    response.headers['Connection'] = 'close'
+    response.headers['Cache-Control'] = 'no-cache'
+    return response
 
 
 @app.route('/')
