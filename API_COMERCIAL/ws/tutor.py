@@ -655,15 +655,6 @@ def subir_desarrollo():
         cursor.close()
         con.close()
 
-        return jsonify({
-            "status":        True,
-            "message":       "Desarrollo subido correctamente",
-            "desarrolloUrl": url_abs
-        }), 200
-
-    except Exception as e:
-        return jsonify({"status": False, "message": str(e)}), 500
-
 
 # =========================================================
 #  GET /tutor/nivel_actual
