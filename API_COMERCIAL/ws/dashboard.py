@@ -1,7 +1,6 @@
 from flask import Blueprint, jsonify
 from conexionBD import Conexion
-from models.Progreso import Progreso
-import json
+from models.scoring import nivel_to_progreso
 
 ws_dashboard = Blueprint('ws_dashboard', __name__, url_prefix='/dashboard')
 
@@ -35,24 +34,32 @@ def mini_dashboard(id_estudiante: int):
     cur = con.cursor()
     try:
         cur.execute("""
-            SELECT u.nombre
+            SELECT TRIM(u.nombre) || ' ' || TRIM(COALESCE(u.apellidos, '')) AS nombre_completo
             FROM usuarios u
             JOIN estudiante e ON e.id_usuario = u.id_usuario
             WHERE e.id_estudiante = %s
             LIMIT 1
         """, (id_estudiante,))
-        row   = cur.fetchone()
-        saludo = (row and row.get('nombre')) or "Alumno"
+        row    = cur.fetchone()
+        saludo = (row and row.get('nombre_completo', '').strip()) or "Alumno"
 
-        lista_json = Progreso.listar(id_estudiante)
-        payload    = json.loads(lista_json)
-        items      = payload.get('data', []) if payload.get('status', False) else []
-        total      = len(items)
-        correctas  = sum(
-            1 for p in items
-            if str(p.get('estado', '')).lower().startswith('correcto')
-        )
-        progreso_general = int(round((correctas / total) * 100)) if total > 0 else 0
+        # Progreso general basado en NEC — misma fórmula que /progreso/resumen
+        cur.execute("""
+            SELECT COALESCE(nec.nivel_actual, 1) AS nivel_actual
+            FROM competencias c
+            LEFT JOIN nivel_estudiante_competencia nec
+                   ON nec.id_competencia = c.id_competencia
+                  AND nec.id_estudiante  = %s
+            WHERE c.id_competencia BETWEEN 1 AND 4
+            ORDER BY c.id_competencia
+        """, (id_estudiante,))
+        rows_nec = cur.fetchall() or []
+        if rows_nec:
+            progreso_general = int(round(
+                sum(nivel_to_progreso(r['nivel_actual']) for r in rows_nec) / len(rows_nec)
+            ))
+        else:
+            progreso_general = 0
 
         cur.execute("""
             SELECT COALESCE(ROUND(AVG(puntaje)), 0)::int AS promedio
@@ -66,22 +73,37 @@ def mini_dashboard(id_estudiante: int):
             SELECT
                 c.id_competencia,
                 c.descripcion,
-                COUNT(DISTINCT e.id_ejercicio) AS total_ejercicios,
-                COUNT(DISTINCT r.id_ejercicio) AS resueltos
+                COALESCE(
+                    nec.nivel_actual,
+                    CASE
+                        WHEN avg_p.avg_score >= 93 THEN 7
+                        WHEN avg_p.avg_score >= 79 THEN 6
+                        WHEN avg_p.avg_score >= 65 THEN 5
+                        WHEN avg_p.avg_score >= 50 THEN 4
+                        WHEN avg_p.avg_score >= 36 THEN 3
+                        WHEN avg_p.avg_score >= 22 THEN 2
+                        ELSE 1
+                    END,
+                    1
+                ) AS nivel_actual
             FROM competencias c
-            LEFT JOIN puntajes p
-                   ON p.id_competencia = c.id_competencia
-                  AND p.id_estudiante = %s
+            LEFT JOIN nivel_estudiante_competencia nec
+                   ON nec.id_competencia = c.id_competencia
+                  AND nec.id_estudiante  = %s
+            LEFT JOIN (
+                SELECT id_competencia, AVG(puntaje) AS avg_score
+                FROM puntajes
+                WHERE id_estudiante = %s
+                GROUP BY id_competencia
+            ) avg_p ON avg_p.id_competencia = c.id_competencia
             WHERE c.id_competencia BETWEEN 1 AND 4
-            GROUP BY c.id_competencia, c.descripcion
             ORDER BY c.id_competencia
-        """, (id_estudiante,))
+        """, (id_estudiante, id_estudiante))
         temas_rows = cur.fetchall() or []
 
         temas = []
         for r in temas_rows:
-            prom = r.get("promedio")
-            pct  = 0 if prom is None else int(round(prom))
+            pct = nivel_to_progreso(r.get("nivel_actual") or 1)
             temas.append({"nombre": r["descripcion"], "porcentaje": pct})
 
         return jsonify({
@@ -319,7 +341,7 @@ def frecuencia_uso(id_docente: int):
                 -- Última actividad (la más reciente entre respuestas y materiales)
                 GREATEST(
                     MAX(r.fecha),
-                    MAX(hm.fecha_revision)
+                    MAX(hm.fecha_acceso)
                 ) AS ultima_actividad
 
             FROM docente_salones ds

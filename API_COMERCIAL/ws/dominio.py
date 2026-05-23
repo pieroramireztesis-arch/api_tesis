@@ -31,11 +31,11 @@ def listar_temas_dominio(id_estudiante):
             -- TOTAL de materiales del tema
             COUNT(DISTINCT m.id_material) AS total_materiales,
 
-            -- MATERIALES vistos (completados) por el estudiante
+            -- MATERIALES vistos (completado o visto) por el estudiante
             COALESCE(
                 COUNT(
-                    DISTINCT CASE 
-                        WHEN h.estado = 'completado' THEN h.id_material
+                    DISTINCT CASE
+                        WHEN h.estado IN ('completado', 'visto') THEN h.id_material
                     END
                 ),
                 0

@@ -1,4 +1,5 @@
-from flask import Flask, send_from_directory
+from flask import Flask, jsonify, send_file
+import mimetypes
 from flask_jwt_extended import JWTManager
 
 # 👇 AGREGAR ESTO JUSTO AQUÍ
@@ -68,10 +69,15 @@ print("📁 ¿Existe?:", os.path.exists(_EJERCICIOS_AYUDA))
 
 @app.route('/ejercicios/imagen/<filename>')
 def servir_imagen_ejercicio(filename):
-    response = send_from_directory(_EJERCICIOS_AYUDA, filename)
-    response.headers['Connection'] = 'close'
-    response.headers['Cache-Control'] = 'no-cache'
-    return response
+    try:
+        filepath = os.path.join(_EJERCICIOS_AYUDA, filename)
+        if not os.path.exists(filepath):
+            return jsonify({"error": "Imagen no encontrada"}), 404
+        mime_type, _ = mimetypes.guess_type(filename)
+        mime_type = mime_type or 'image/jpeg'
+        return send_file(filepath, mimetype=mime_type, max_age=3600)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route('/')

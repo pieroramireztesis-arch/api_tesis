@@ -16,7 +16,7 @@ def registrar_salon():
 # Listar todos los salones
 @ws_salon.route('', methods=['GET'])
 def listar_salones():
-    return jsonify(json.loads(Salon.listar_todos()))
+    return jsonify(json.loads(Salon.listar()))
 
 # Actualizar salón
 @ws_salon.route('/<int:id_salon>', methods=['PUT'])

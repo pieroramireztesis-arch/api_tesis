@@ -1,5 +1,6 @@
 from flask import Blueprint, request, jsonify
 from models.Progreso import Progreso
+from models.scoring import nivel_to_progreso, NIVEL_NOMBRE
 from conexionBD import Conexion
 import json
 
@@ -78,27 +79,40 @@ def resumen_progreso():
         row_mat = cur.fetchone() or {}
         total_lecciones = int(row_mat.get("total_mat", 0) or 0)
 
-        # Promedio por competencia (todas las 4 MINEDU)
+        # Progreso por competencia desde NEC; si NEC vacío usa puntajes diagnóstico
         cur.execute("""
             SELECT
                 c.id_competencia,
-                AVG(p.puntaje) AS promedio
+                COALESCE(
+                    nec.nivel_actual,
+                    CASE
+                        WHEN avg_p.avg_score >= 93 THEN 7
+                        WHEN avg_p.avg_score >= 79 THEN 6
+                        WHEN avg_p.avg_score >= 65 THEN 5
+                        WHEN avg_p.avg_score >= 50 THEN 4
+                        WHEN avg_p.avg_score >= 36 THEN 3
+                        WHEN avg_p.avg_score >= 22 THEN 2
+                        ELSE 1
+                    END,
+                    1
+                ) AS nivel_actual
             FROM competencias c
-            LEFT JOIN puntajes p
-                   ON p.id_competencia = c.id_competencia
-                  AND p.id_estudiante  = %s
+            LEFT JOIN nivel_estudiante_competencia nec
+                   ON nec.id_competencia = c.id_competencia
+                  AND nec.id_estudiante  = %s
+            LEFT JOIN (
+                SELECT id_competencia, AVG(puntaje) AS avg_score
+                FROM puntajes
+                WHERE id_estudiante = %s
+                GROUP BY id_competencia
+            ) avg_p ON avg_p.id_competencia = c.id_competencia
             WHERE c.id_competencia BETWEEN 1 AND 4
-            GROUP BY c.id_competencia
             ORDER BY c.id_competencia
-        """, (id_estudiante,))
+        """, (id_estudiante, id_estudiante))
 
-        rows_comp = cur.fetchall() or []
-        suma = 0
-        for row in rows_comp:
-            prom = row.get("promedio")
-            if prom is not None:
-                suma += float(prom)
-        porcentaje = max(0, min(100, int(round(suma / 4))))
+        rows_comp  = cur.fetchall() or []
+        suma_pct   = sum(nivel_to_progreso(r.get("nivel_actual") or 1) for r in rows_comp)
+        porcentaje = int(round(suma_pct / 4)) if rows_comp else 0
 
         if porcentaje >= 80:
             resumen = "¡Excelente! Dominas todas las competencias."
@@ -147,43 +161,47 @@ def progreso_por_competencia():
     con    = Conexion()
     cursor = con.cursor()
     try:
-        # porcentaje = ((nivel_actual-1)/6)*70  +  (promedio_puntaje/100)*30
+        # Lee nivel/score desde NEC; si NEC vacío cae en puntajes diagnóstico
         cursor.execute("""
             SELECT
                 c.id_competencia,
                 c.descripcion,
-                COALESCE(nec.nivel_actual, 0)  AS nivel_actual,
-                COALESCE(AVG(p.puntaje), 0)    AS promedio_puntaje
+                COALESCE(
+                    nec.nivel_actual,
+                    CASE
+                        WHEN avg_p.avg_score >= 93 THEN 7
+                        WHEN avg_p.avg_score >= 79 THEN 6
+                        WHEN avg_p.avg_score >= 65 THEN 5
+                        WHEN avg_p.avg_score >= 50 THEN 4
+                        WHEN avg_p.avg_score >= 36 THEN 3
+                        WHEN avg_p.avg_score >= 22 THEN 2
+                        ELSE 1
+                    END,
+                    1
+                ) AS nivel_actual,
+                COALESCE(nec.promedio_puntaje, avg_p.avg_score, 0) AS score
             FROM competencias c
-            LEFT JOIN puntajes p
-                   ON p.id_competencia = c.id_competencia
-                  AND p.id_estudiante  = %s
             LEFT JOIN nivel_estudiante_competencia nec
                    ON nec.id_competencia = c.id_competencia
                   AND nec.id_estudiante  = %s
+            LEFT JOIN (
+                SELECT id_competencia, AVG(puntaje) AS avg_score
+                FROM puntajes
+                WHERE id_estudiante = %s
+                GROUP BY id_competencia
+            ) avg_p ON avg_p.id_competencia = c.id_competencia
             WHERE c.id_competencia BETWEEN 1 AND 4
-            GROUP BY c.id_competencia, c.descripcion, nec.nivel_actual
             ORDER BY c.id_competencia
         """, (id_estudiante, id_estudiante))
 
         rows  = cursor.fetchall() or []
         temas = []
         for row in rows:
-            nivel_actual     = int(row.get("nivel_actual") or 0)
-            promedio_puntaje = float(row.get("promedio_puntaje") or 0)
+            nivel_actual = int(row.get("nivel_actual") or 1)
+            score        = float(row.get("score") or 0)
 
-            pct = max(0, min(100, int(round((nivel_actual / 7) * 100))))
-
-            nombre_nivel = {
-                0: "Sin iniciar",
-                1: "Iniciando",
-                2: "Básico",
-                3: "En progreso",
-                4: "Intermedio",
-                5: "Avanzado",
-                6: "Casi experto",
-                7: "Dominio completo"
-            }.get(nivel_actual, "Sin datos")
+            pct          = nivel_to_progreso(nivel_actual)
+            nombre_nivel = NIVEL_NOMBRE.get(nivel_actual, "Sin datos")
 
             temas.append({
                 "idCompetencia":   row["id_competencia"],
@@ -191,7 +209,7 @@ def progreso_por_competencia():
                 "porcentaje":      pct,
                 "nivelActual":     nivel_actual,
                 "nombreNivel":     nombre_nivel,
-                "promedioPuntaje": int(round(promedio_puntaje))
+                "promedioPuntaje": int(round(score))
             })
 
         return jsonify({"status": True, "temas": temas}), 200
@@ -200,7 +218,7 @@ def progreso_por_competencia():
         print("Error en /progreso/por_competencia:", str(e))
         return jsonify({"status": False, "mensaje": str(e)}), 500
     finally:
-        cur.close()
+        cursor.close()
         con.close()
 
 
@@ -232,8 +250,6 @@ def historial_progreso():
         cur.execute("""
             SELECT
                 p.id_progreso,
-                p.fecha,
-                p.estado,
                 p.id_ejercicio,
                 p.estado,
                 p.fecha,
@@ -255,18 +271,15 @@ def historial_progreso():
             LEFT JOIN opciones_ejercicio op
                 ON op.id_opcion = r.id_opcion
             LEFT JOIN respuestas_estudiantes r2
-                ON r2.id_estudiante = p.id_estudiante
-               AND r2.id_ejercicio  = p.id_ejercicio
-               AND r2.desarrollo_url IS NOT NULL
-               AND r2.id_respuesta = (
-                   SELECT r3.id_respuesta
-                   FROM respuestas_estudiantes r3
-                   WHERE r3.id_estudiante = p.id_estudiante
-                     AND r3.id_ejercicio  = p.id_ejercicio
-                     AND r3.fecha <= p.fecha
-                   ORDER BY r3.id_respuesta DESC
-                   LIMIT 1
-               )
+                ON r2.id_respuesta = (
+                    SELECT r3.id_respuesta
+                    FROM respuestas_estudiantes r3
+                    WHERE r3.id_estudiante  = p.id_estudiante
+                      AND r3.id_ejercicio   = p.id_ejercicio
+                      AND r3.desarrollo_url IS NOT NULL
+                    ORDER BY r3.id_respuesta DESC
+                    LIMIT 1
+                )
             WHERE p.id_estudiante = %s
             GROUP BY
                 p.id_progreso,
@@ -344,3 +357,52 @@ def eliminar_progreso(id_progreso):
         return jsonify(json.loads(Progreso.eliminar(id_progreso)))
     except Exception as e:
         return jsonify({"status": False, "mensaje": str(e)}), 500
+    
+
+
+# ==========================
+#  GET /progreso/chart?idEstudiante=4
+#  Devuelve puntos reales agrupados por hora para el gráfico lineal
+# ==========================
+@ws_progreso.route('/chart', methods=['GET'])
+def progreso_chart():
+    id_estudiante = request.args.get('idEstudiante', type=int)
+    if not id_estudiante:
+        return jsonify({"status": False, "mensaje": "idEstudiante es obligatorio"}), 400
+
+    con = Conexion()
+    cur = con.cursor()
+    try:
+        cur.execute("""
+            SELECT
+                TO_CHAR(DATE_TRUNC('hour', r.fecha), 'DD/MM HH24') || 'h' AS fecha,
+                ROUND(
+                    100.0 * SUM(CASE WHEN op.es_correcta THEN 1 ELSE 0 END)
+                    / NULLIF(COUNT(r.id_respuesta), 0)
+                ) AS puntaje
+            FROM respuestas_estudiantes r
+            JOIN opciones_ejercicio op ON op.id_opcion = r.id_opcion
+            WHERE r.id_estudiante = %s
+              AND r.fecha IS NOT NULL
+            GROUP BY DATE_TRUNC('hour', r.fecha)
+            ORDER BY DATE_TRUNC('hour', r.fecha) ASC
+            LIMIT 60
+        """, (id_estudiante,))
+
+        rows = cur.fetchall() or []
+        datos = [
+            {
+                "fecha":   row["fecha"],
+                "puntaje": int(row["puntaje"] or 0)
+            }
+            for row in rows
+        ]
+
+        return jsonify({"status": True, "datos_chart": datos}), 200
+
+    except Exception as e:
+        print("Error en /progreso/chart:", str(e))
+        return jsonify({"status": False, "mensaje": str(e)}), 500
+    finally:
+        cur.close()
+        con.close()

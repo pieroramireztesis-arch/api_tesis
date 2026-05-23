@@ -11,15 +11,47 @@ ws_historial_material = Blueprint('ws_historial_material', __name__, url_prefix=
 # ================================
 @ws_historial_material.route("", methods=["POST"])
 def registrar_historial():
-    data = request.get_json()
+    data = request.get_json() or {}
 
-    id_estudiante = data.get("id_estudiante")
-    id_material = data.get("id_material")
-    tiempo_visualizacion = data.get("tiempo_visualizacion")
+    id_estudiante        = data.get("id_estudiante")
+    id_material          = data.get("id_material")
+    tiempo_visualizacion = data.get("tiempo_visto") or data.get("tiempo_visualizacion")
 
-    return jsonify(json.loads(
-        HistorialMaterial.registrar(id_estudiante, id_material, tiempo_visualizacion)
-    ))
+    if not id_estudiante or not id_material:
+        return jsonify({"status": False, "message": "Faltan parámetros"})
+
+    # Escribe en historial_material_estudio (tabla activa usada por dominio y progreso)
+    con = Conexion()
+    cur = con.cursor()
+    try:
+        # Si el estudiante estuvo >= 240s en el material → completado, si no → visto
+        estado_calc = 'completado' if (tiempo_visualizacion or 0) >= 240 else 'visto'
+
+        cur.execute("""
+            INSERT INTO historial_material_estudio
+                (id_estudiante, id_material, estado,
+                 tiempo_visto, veces_revisado, fecha_acceso)
+            VALUES (%s, %s, %s, %s, 1, NOW())
+            ON CONFLICT (id_estudiante, id_material) DO UPDATE SET
+                -- No degradar: si ya estaba completado, se queda completado
+                estado         = CASE
+                                   WHEN historial_material_estudio.estado = 'completado' THEN 'completado'
+                                   ELSE EXCLUDED.estado
+                                 END,
+                tiempo_visto   = COALESCE(
+                                   historial_material_estudio.tiempo_visto, 0)
+                                 + COALESCE(EXCLUDED.tiempo_visto, 0),
+                veces_revisado = historial_material_estudio.veces_revisado + 1,
+                fecha_acceso   = NOW()
+        """, (id_estudiante, id_material, estado_calc, tiempo_visualizacion))
+        con.commit()
+        return jsonify({"status": True, "message": "Historial registrado"})
+    except Exception as e:
+        con.rollback()
+        return jsonify({"status": False, "message": str(e)})
+    finally:
+        cur.close()
+        con.close()
 
 
 # ================================

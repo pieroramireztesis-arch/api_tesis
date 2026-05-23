@@ -129,6 +129,33 @@ def register():
 
         new_row = cur.fetchone()
         new_id  = new_row['id_usuario']
+        rol     = data.get('rol', 'estudiante')
+
+        id_estudiante = None
+        id_docente    = None
+
+        if rol == 'estudiante':
+            cur.execute("""
+                INSERT INTO estudiante
+                    (id_usuario, grado,
+                     cantidad, regularidad_equivalencia_cambio,
+                     forma_movimiento_localizacion, gestion_datos_incertidumbre,
+                     progreso_general, estado_estudiante)
+                VALUES (%s, NULL, NULL, NULL, NULL, NULL, 0, 'activo')
+                RETURNING id_estudiante
+            """, (new_id,))
+            est_row       = cur.fetchone()
+            id_estudiante = est_row['id_estudiante'] if est_row else None
+
+        elif rol == 'docente':
+            cur.execute("""
+                INSERT INTO docente (especialidad, id_usuario)
+                VALUES ('Álgebra', %s)
+                RETURNING id_docente
+            """, (new_id,))
+            doc_row    = cur.fetchone()
+            id_docente = doc_row['id_docente'] if doc_row else None
+
         con.commit()
 
         user = {
@@ -136,9 +163,9 @@ def register():
             'nombre':        data['nombre'],
             'apellidos':     data['apellidos'],
             'correo':        data['correo'],
-            'rol':           data.get('rol', 'estudiante'),
-            'id_docente':    None,
-            'id_estudiante': None
+            'rol':           rol,
+            'id_docente':    id_docente,
+            'id_estudiante': id_estudiante
         }
 
         access_token = create_access_token(

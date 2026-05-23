@@ -1,10 +1,15 @@
 # ws_tutor.py
 import os
+import json
 import pickle
 import numpy as np
 from flask import Blueprint, request, jsonify
 from werkzeug.utils import secure_filename
 from conexionBD import Conexion
+from models.scoring import (
+    calcular_delta, score_to_nivel, nivel_to_progreso,
+    nivel_display_texto, NIVEL_EJERCICIO_WHERE, NIVEL_NOMBRE,
+)
 
 ws_tutor = Blueprint("ws_tutor", __name__, url_prefix="/tutor")
 
@@ -36,8 +41,9 @@ except Exception as e:
 
 
 # =========================================
-# FUNCIONES AUXILIARES ML
+# FUNCIONES AUXILIARES
 # =========================================
+
 def calcular_features_competencia(cursor, id_estudiante, id_competencia):
     cursor.execute("""
         SELECT COUNT(*)  AS total_intentos,
@@ -70,138 +76,133 @@ def calcular_features_competencia(cursor, id_estudiante, id_competencia):
     return np.array([[float(total), promedio, min_p, max_p, tasa]], dtype=float)
 
 
-
-def predecir_nivel_competencia(cursor, id_estudiante, id_competencia):
-    nivel_texto = None
-
-    if MODELO_TUTOR is not None:
-        X = calcular_features_competencia(cursor, id_estudiante, id_competencia)
-        if X is not None:
-            try:
-                y_pred      = MODELO_TUTOR.predict(X)[0]
-                nivel_texto = ENCODER_NIVEL.inverse_transform([y_pred])[0] \
-                              if ENCODER_NIVEL else str(y_pred)
-                print(f">>> ML features: {X}")
-                print(f">>> ML prediccion: {y_pred}")
-                print(f">>> Ajuste aplicado: {nivel_texto}")
-                print(f"🤖 ML predijo nivel '{nivel_texto}' "
-                      f"para est={id_estudiante} comp={id_competencia}")
-            except Exception as e:
-                print("Error predicción ML:", e)
-
-    if nivel_texto is None:
-        # ✅ FIX: usar nivel_estudiante_competencia en lugar de columnas estáticas
-        cursor.execute("""
-            SELECT nivel_actual
-            FROM nivel_estudiante_competencia
-            WHERE id_estudiante = %s
-              AND id_competencia = %s
-        """, (id_estudiante, id_competencia))
-        row_nec = cursor.fetchone()
-
-        if row_nec and row_nec.get("nivel_actual"):
-            nivel_actual = int(row_nec["nivel_actual"])
-            if nivel_actual <= 2:
-                nivel_texto = "bajo"
-            elif nivel_actual <= 4:
-                nivel_texto = "medio"
-            else:
-                nivel_texto = "alto"
-            print(f"📋 Fallback NEC id_comp={id_competencia}: "
-                  f"nivel_actual={nivel_actual} → '{nivel_texto}'")
-        else:
-            nivel_texto = "bajo"
-            print(f"📋 Fallback nuevo estudiante id_comp={id_competencia}: 'bajo'")
-
-    return nivel_texto
-
-
-def actualizar_nivel_estudiante_competencia(cursor, id_estudiante,
-                                            id_competencia, nivel_texto):
-    if nivel_texto is None:
-        return None, None
-
+def leer_nec(cursor, id_estudiante, id_competencia):
+    """
+    Lee nivel_actual y score (promedio_puntaje) de NEC.
+    Si no existe el registro inicializa con nivel=1, score=0.
+    Retorna (nivel_actual: int, score: float).
+    """
     cursor.execute("""
-        SELECT nivel_actual FROM nivel_estudiante_competencia
+        SELECT nivel_actual, COALESCE(promedio_puntaje, 0) AS score
+        FROM nivel_estudiante_competencia
         WHERE id_estudiante = %s AND id_competencia = %s
     """, (id_estudiante, id_competencia))
-    row_actual       = cursor.fetchone()
-    nivel_actual_bd  = int((row_actual or {}).get("nivel_actual") or 0)
-
-    nivel_objetivo = 2 if nivel_texto == "bajo" else 4 if nivel_texto == "medio" else 6
-
-    if nivel_objetivo < nivel_actual_bd:
-        nivel_int = max(nivel_objetivo, nivel_actual_bd - 1)
-    else:
-        nivel_int = nivel_objetivo
-
+    row = cursor.fetchone()
+    if row:
+        return int(row.get("nivel_actual") or 1), float(row.get("score") or 0)
+    # Sin registro: puede ser alumno nuevo. Si hay puntaje asignado por docente,
+    # inicializar desde ahí.
     cursor.execute("""
-        SELECT COUNT(*) AS total, AVG(puntaje) AS promedio
+        SELECT AVG(puntaje) AS avg_p
         FROM puntajes
         WHERE id_estudiante = %s AND id_competencia = %s
     """, (id_estudiante, id_competencia))
-    row      = cursor.fetchone() or {}
-    total    = int(row.get("total") or 0)
-    promedio = float(row.get("promedio") or 0.0)
-
+    row_p = cursor.fetchone() or {}
+    score_ini = float(row_p.get("avg_p") or 0)
+    nivel_ini = score_to_nivel(score_ini)
     cursor.execute("""
         INSERT INTO nivel_estudiante_competencia
             (id_estudiante, id_competencia, nivel_actual,
              promedio_puntaje, ejercicios_considerados, fecha_ultimo_update)
-        VALUES (%s, %s, %s, %s, %s, NOW())
+        VALUES (%s, %s, %s, %s, 0, NOW())
+        ON CONFLICT (id_estudiante, id_competencia) DO NOTHING
+    """, (id_estudiante, id_competencia, nivel_ini, score_ini))
+    return nivel_ini, score_ini
+
+
+def guardar_nec(cursor, id_estudiante, id_competencia, nuevo_score, nuevo_nivel):
+    cursor.execute("""
+        INSERT INTO nivel_estudiante_competencia
+            (id_estudiante, id_competencia, nivel_actual,
+             promedio_puntaje, ejercicios_considerados, fecha_ultimo_update)
+        VALUES (%s, %s, %s, %s, 0, NOW())
         ON CONFLICT (id_estudiante, id_competencia) DO UPDATE SET
-            nivel_actual            = EXCLUDED.nivel_actual,
-            promedio_puntaje        = EXCLUDED.promedio_puntaje,
-            ejercicios_considerados = EXCLUDED.ejercicios_considerados,
-            fecha_ultimo_update     = EXCLUDED.fecha_ultimo_update
-    """, (id_estudiante, id_competencia, nivel_int, promedio, total))
+            nivel_actual        = EXCLUDED.nivel_actual,
+            promedio_puntaje    = EXCLUDED.promedio_puntaje,
+            fecha_ultimo_update = EXCLUDED.fecha_ultimo_update
+    """, (id_estudiante, id_competencia, nuevo_nivel, nuevo_score))
 
+
+def detectar_racha(cursor, id_estudiante, id_competencia, n=3):
+    """
+    Retorna:
+      'positiva' → últimas n respuestas todas correctas → dar ejercicio más difícil
+      'negativa' → últimas n respuestas todas incorrectas → dar ejercicio más fácil
+      None       → mixto
+    Solo considera respuestas en modo 'repaso' para no contaminar con evaluaciones.
+    """
     cursor.execute("""
-        SELECT AVG(nivel_actual) AS prom
-        FROM nivel_estudiante_competencia
-        WHERE id_estudiante = %s
-    """, (id_estudiante,))
-    prom         = float((cursor.fetchone() or {}).get("prom") or 0)
-    nivel_global = "bajo" if prom < 3 else "medio" if prom < 5 else "alto"
-
-    return nivel_int, nivel_global
-
-
-def actualizar_progreso_estudiante(con, cursor, id_estudiante):
-    cursor.execute("""
-        SELECT c.area, AVG(p.puntaje) AS promedio
-        FROM puntajes p
-        JOIN competencias c ON c.id_competencia = p.id_competencia
-        WHERE p.id_estudiante = %s AND c.area IS NOT NULL
-        GROUP BY c.area
-    """, (id_estudiante,))
+        SELECT op.es_correcta
+        FROM respuestas_estudiantes r
+        JOIN opciones_ejercicio op ON op.id_opcion = r.id_opcion
+        JOIN ejercicios e ON e.id_ejercicio = r.id_ejercicio
+        WHERE r.id_estudiante = %s AND e.id_competencia = %s
+          AND r.modo = 'repaso'
+        ORDER BY r.fecha DESC
+        LIMIT %s
+    """, (id_estudiante, id_competencia, n))
     rows = cursor.fetchall()
+    if len(rows) < n:
+        return None
+    if all(r["es_correcta"] for r in rows):
+        return "positiva"
+    if not any(r["es_correcta"] for r in rows):
+        return "negativa"
+    return None
 
-    cant = reg = forma = datos = None
-    for row in rows:
-        area = row["area"]
-        prom = int(round(row["promedio"])) if row["promedio"] is not None else None
-        if area == "cantidad":
-            cant  = prom
-        elif area == "regularidad_equivalencia_cambio":
-            reg   = prom
-        elif area == "forma_movimiento_localizacion":
-            forma = prom
-        elif area == "gestion_datos_incertidumbre":
-            datos = prom
 
-    valores          = [v for v in [cant, reg, forma, datos] if v is not None]
-    progreso_general = int(round(sum(valores) / len(valores))) if valores else None
+def predecir_nivel_competencia(cursor, id_estudiante, id_competencia):
+    """
+    Devuelve el nivel de dificultad a usar ('bajo'/'medio'/'alto')
+    basándose en NEC (fuente autoritativa) con ajuste ±1 del modelo ML.
+    """
+    nivel_actual, _ = leer_nec(cursor, id_estudiante, id_competencia)
+    nivel_base = nivel_display_texto(nivel_actual)
+    print(f"📋 NEC comp={id_competencia}: nivel_actual={nivel_actual} → base='{nivel_base}'")
+
+    if MODELO_TUTOR is not None and nivel_actual > 2:
+        X = calcular_features_competencia(cursor, id_estudiante, id_competencia)
+        if X is not None:
+            try:
+                y_pred   = MODELO_TUTOR.predict(X)[0]
+                nivel_ml = (ENCODER_NIVEL.inverse_transform([y_pred])[0]
+                            if ENCODER_NIVEL else str(y_pred))
+                print(f"🤖 ML predijo '{nivel_ml}' est={id_estudiante} comp={id_competencia}")
+
+                _orden   = {"bajo": 0, "medio": 1, "alto": 2}
+                _inverso = {0: "bajo", 1: "medio", 2: "alto"}
+                base_idx = _orden.get(nivel_base, 0)
+                ml_idx   = _orden.get(nivel_ml, base_idx)
+                acotado  = min(ml_idx, base_idx + 1)
+                nivel_final = _inverso[acotado]
+                print(f"🎯 Nivel final (acotado): '{nivel_final}'")
+                return nivel_final
+            except Exception as e:
+                print("Error predicción ML:", e)
+
+    return nivel_base
+
+
+def actualizar_progreso_estudiante(cursor, id_estudiante):
+    """Actualiza progreso_general en tabla estudiante usando la fórmula unificada."""
+    cursor.execute("""
+        SELECT id_competencia, COALESCE(nivel_actual, 1) AS nivel_actual
+        FROM nivel_estudiante_competencia
+        WHERE id_estudiante = %s AND id_competencia BETWEEN 1 AND 4
+    """, (id_estudiante,))
+    rows = cursor.fetchall() or []
+
+    if not rows:
+        return
+
+    total_progreso = sum(nivel_to_progreso(r["nivel_actual"]) for r in rows)
+    progreso_general = int(round(total_progreso / 4))
 
     cursor.execute("""
         UPDATE estudiante
-        SET cantidad                        = COALESCE(%s, cantidad),
-            regularidad_equivalencia_cambio = COALESCE(%s, regularidad_equivalencia_cambio),
-            forma_movimiento_localizacion   = COALESCE(%s, forma_movimiento_localizacion),
-            gestion_datos_incertidumbre     = COALESCE(%s, gestion_datos_incertidumbre),
-            progreso_general                = COALESCE(%s, progreso_general)
+        SET progreso_general = %s
         WHERE id_estudiante = %s
-    """, (cant, reg, forma, datos, progreso_general, id_estudiante))
+    """, (progreso_general, id_estudiante))
 
 
 # =========================================================
@@ -222,17 +223,43 @@ def ejercicio_siguiente():
     cursor = con.cursor()
 
     try:
-        # Verificar si el alumno ya completó el número de preguntas de la evaluación
+        # ── Verificar que el docente haya asignado el diagnóstico inicial ──
+        cursor.execute("""
+            SELECT (cantidad IS NULL
+                    AND regularidad_equivalencia_cambio IS NULL
+                    AND forma_movimiento_localizacion   IS NULL
+                    AND gestion_datos_incertidumbre     IS NULL) AS sin_diagnostico
+            FROM estudiante
+            WHERE id_estudiante = %s
+        """, (id_estudiante,))
+        row_diag = cursor.fetchone()
+        if row_diag and row_diag.get("sin_diagnostico"):
+            return jsonify({
+                "status":         False,
+                "sinEjercicios":  True,
+                "bloqueado":      True,
+                "mensaje": (
+                    "Tu docente aún no ha registrado tu diagnóstico inicial. "
+                    "Contacta a tu profesor para que complete tu evaluación y puedas comenzar a practicar."
+                ),
+            }), 200
+
+        # ── Evaluación: verificar límite y usar ejercicios pre-seleccionados ──
         if modo == "evaluacion" and id_evaluacion:
             cursor.execute("""
-                SELECT ev.num_preguntas,
+                SELECT ev.ejercicios_grupos,
+                       ev.num_preguntas,
+                       COALESCE(eg.grupo, 'A') AS grupo,
                        COALESCE(er.total_preguntas, 0) AS ya_respondidas
                 FROM evaluaciones ev
+                LEFT JOIN evaluacion_grupos eg
+                       ON eg.id_evaluacion = ev.id_evaluacion
+                      AND eg.id_estudiante  = %s
                 LEFT JOIN evaluacion_resultados er
-                      ON er.id_evaluacion = ev.id_evaluacion
-                     AND er.id_estudiante  = %s
+                       ON er.id_evaluacion  = ev.id_evaluacion
+                      AND er.id_estudiante  = %s
                 WHERE ev.id_evaluacion = %s
-            """, (id_estudiante, id_evaluacion))
+            """, (id_estudiante, id_estudiante, id_evaluacion))
             row_ev = cursor.fetchone()
             if row_ev:
                 limite  = int(row_ev["num_preguntas"] or 10)
@@ -244,29 +271,146 @@ def ejercicio_siguiente():
                         "mensaje":       "Ya completaste todas las preguntas de esta evaluación.",
                     }), 200
 
+                # Intentar usar ejercicios pre-seleccionados del grupo asignado
+                grupos_json = row_ev.get("ejercicios_grupos")
+                grupo       = str(row_ev.get("grupo") or "A").upper()
+                if grupos_json:
+                    try:
+                        grupos_dict = json.loads(grupos_json) if isinstance(grupos_json, str) else grupos_json
+                        ids_grupo   = [int(x) for x in (grupos_dict.get(grupo) or [])]
+                        if ids_grupo:
+                            cursor.execute("""
+                                SELECT e.id_ejercicio,
+                                       e.descripcion  AS enunciado,
+                                       e.imagen_url,
+                                       e.pista,
+                                       e.nivel        AS nivel_ejercicio,
+                                       c.id_competencia,
+                                       c.descripcion  AS competencia
+                                FROM ejercicios e
+                                JOIN competencias c ON e.id_competencia = c.id_competencia
+                                WHERE e.id_ejercicio = ANY(%s)
+                                  AND NOT EXISTS (
+                                      SELECT 1 FROM respuestas_estudiantes r
+                                      WHERE r.id_ejercicio  = e.id_ejercicio
+                                        AND r.id_estudiante = %s
+                                        AND r.modo          = 'evaluacion'
+                                  )
+                                  AND EXISTS (
+                                      SELECT 1 FROM opciones_ejercicio oe
+                                      WHERE oe.id_ejercicio = e.id_ejercicio
+                                  )
+                                ORDER BY RANDOM()
+                                LIMIT 1
+                            """, (ids_grupo, id_estudiante))
+                            ej_pre = cursor.fetchone()
+                            if ej_pre:
+                                id_ej_pre   = ej_pre["id_ejercicio"]
+                                id_comp_pre = ej_pre["id_competencia"]
+                                nivel_pre   = ej_pre["nivel_ejercicio"]
+
+                                imagen_url_pre = None
+                                img_bd = ej_pre.get("imagen_url")
+                                if img_bd:
+                                    base           = request.host_url.rstrip("/")
+                                    nombre         = os.path.basename(img_bd)
+                                    imagen_url_pre = f"{base}/ejercicios/imagen/{nombre}"
+
+                                cursor.execute("""
+                                    SELECT id_opcion, letra, descripcion
+                                    FROM opciones_ejercicio
+                                    WHERE id_ejercicio = %s
+                                    ORDER BY letra
+                                """, (id_ej_pre,))
+                                opciones_pre = [
+                                    {"idOpcion": o["id_opcion"], "letra": o["letra"], "texto": o["descripcion"]}
+                                    for o in cursor.fetchall()
+                                ]
+
+                                nivel_nec_pre, _ = leer_nec(cursor, id_estudiante, id_comp_pre)
+                                nivel_est_pre    = nivel_display_texto(nivel_nec_pre)
+
+                                print(f"📋 Evaluación: ejercicio pre-seleccionado id={id_ej_pre} grupo={grupo}")
+                                return jsonify({
+                                    "status":                     True,
+                                    "sinEjercicios":              False,
+                                    "idEjercicio":                id_ej_pre,
+                                    "idCompetencia":              id_comp_pre,
+                                    "enunciado":                  ej_pre["enunciado"],
+                                    "imagenUrl":                  imagen_url_pre,
+                                    "opciones":                   opciones_pre,
+                                    "pista":                      None,
+                                    "modo":                       modo,
+                                    "nivelEjercicio":             nivel_pre,
+                                    "nivelEstudianteCompetencia": nivel_est_pre,
+                                    "mensaje":                    None,
+                                }), 200
+                    except Exception as e_grupo:
+                        print(f"⚠️ Error leyendo ejercicios_grupos: {e_grupo}")
+                # Sin pre-selección → caer en selección aleatoria normal
+
         where  = []
         params = []
 
         if id_dominio:
-            filtros.append("e.id_competencia = %s")
+            where.append("e.id_competencia = %s")
             params.append(id_dominio)
 
-        if ajuste == "mas_dificil":
-            where.append("e.nivel >= 2")
-        elif ajuste == "mas_facil":
-            where.append("e.nivel = 1")
-        else:
-            id_comp_nivel  = id_dominio or 1
-            nivel_predicho = predecir_nivel_competencia(cursor, id_estudiante, id_comp_nivel)
-            print(f"🎯 Nivel predicho para ejercicio: '{nivel_predicho}'")
-
-            if nivel_predicho == "alto":
-                where.append("e.nivel >= 2")
-            elif nivel_predicho == "medio":
-                where.append("e.nivel BETWEEN 1 AND 2")
+        # ── Selección de dificultad ───────────────────────────────────────
+        if ajuste in ("mas_dificil", "mas_facil"):
+            # Leer NEC para ajuste relativo al nivel real del estudiante
+            if id_dominio:
+                nivel_base_ajuste, _ = leer_nec(cursor, id_estudiante, id_dominio)
             else:
-                where.append("e.nivel = 1")
+                cursor.execute("""
+                    SELECT COALESCE(MIN(nivel_actual), 1) AS nivel_min
+                    FROM nivel_estudiante_competencia
+                    WHERE id_estudiante = %s AND id_competencia BETWEEN 1 AND 4
+                """, (id_estudiante,))
+                nivel_base_ajuste = int((cursor.fetchone() or {}).get("nivel_min") or 1)
 
+            nivel_adj = (min(7, nivel_base_ajuste + 1) if ajuste == "mas_dificil"
+                         else max(1, nivel_base_ajuste - 1))
+            nivel_where = NIVEL_EJERCICIO_WHERE.get(nivel_adj, "e.nivel = 1")
+            where.append(nivel_where)
+            print(f"⚙️ ajuste='{ajuste}' base={nivel_base_ajuste} → nivel_adj={nivel_adj} filtro={nivel_where}")
+        else:
+            # 1) Determinar nivel base desde NEC + predicción ML
+            if id_dominio:
+                nivel_actual_int, _ = leer_nec(cursor, id_estudiante, id_dominio)
+                nivel_predicho_texto = predecir_nivel_competencia(
+                    cursor, id_estudiante, id_dominio
+                )
+            else:
+                cursor.execute("""
+                    SELECT COALESCE(MIN(nivel_actual), 1) AS nivel_min
+                    FROM nivel_estudiante_competencia
+                    WHERE id_estudiante = %s AND id_competencia BETWEEN 1 AND 4
+                """, (id_estudiante,))
+                row_min = cursor.fetchone() or {}
+                nivel_actual_int = int(row_min.get("nivel_min") or 1)
+                nivel_predicho_texto = nivel_display_texto(nivel_actual_int)
+                print(f"📊 Nivel global mínimo={nivel_actual_int} → '{nivel_predicho_texto}'")
+
+            # 2) Convertir predicción ML a entero para NIVEL_EJERCICIO_WHERE
+            _ML_TO_INT = {"bajo": 1, "medio": 3, "alto": 5}
+            nivel_para_ejercicio = _ML_TO_INT.get(nivel_predicho_texto, nivel_actual_int)
+
+            # 3) Ajuste por racha aplicado sobre el nivel predicho por ML
+            if id_dominio:
+                racha = detectar_racha(cursor, id_estudiante, id_dominio)
+                if racha == "positiva":
+                    nivel_para_ejercicio = min(7, nivel_para_ejercicio + 1)
+                    print(f"🔥 Racha positiva → nivel_ejercicio={nivel_para_ejercicio}")
+                elif racha == "negativa":
+                    nivel_para_ejercicio = max(1, nivel_para_ejercicio - 1)
+                    print(f"❄️ Racha negativa → nivel_ejercicio={nivel_para_ejercicio}")
+
+            nivel_where = NIVEL_EJERCICIO_WHERE.get(nivel_para_ejercicio, "e.nivel <= 3")
+            where.append(nivel_where)
+            print(f"🎯 ML='{nivel_predicho_texto}'→{nivel_para_ejercicio} | Filtro: {nivel_where}")
+
+        # ── Excluir ejercicios ya respondidos en este modo ────────────────
         if modo == "evaluacion":
             where.append("""
                 NOT EXISTS(
@@ -313,11 +457,31 @@ def ejercicio_siguiente():
 
         ejercicio = cursor.fetchone()
 
-        # ===========================================================
-        # 5) Si NO hay ejercicios nuevos → permitir reforzar antiguos
-        # ===========================================================
+        # Fallback 1 (solo repaso): misma dificultad, permite repetir ejercicios ya respondidos
+        if not ejercicio and modo != "evaluacion":
+            print("⚠️ Ejercicios del nivel agotados. Permitiendo repetición en repaso...")
+            params_sin_exists = params[:-1]  # eliminar el id_estudiante del NOT EXISTS
+            where_sin_exists  = [w for w in where if "NOT EXISTS" not in w]
+            wc_sin_exists = ("WHERE " + " AND ".join(where_sin_exists)) if where_sin_exists else ""
+            cursor.execute(f"""
+                SELECT e.id_ejercicio,
+                       e.descripcion  AS enunciado,
+                       e.imagen_url,
+                       e.pista,
+                       e.nivel        AS nivel_ejercicio,
+                       c.id_competencia,
+                       c.descripcion  AS competencia
+                FROM ejercicios e
+                JOIN competencias c ON e.id_competencia = c.id_competencia
+                {wc_sin_exists}
+                ORDER BY RANDOM()
+                LIMIT 1
+            """, tuple(params_sin_exists))
+            ejercicio = cursor.fetchone()
+
+        # Fallback 2: cualquier dificultad, sin repetir (mantiene filtro de competencia)
         if not ejercicio:
-            print("⚠️ No hay ejercicios del nivel predicho. Intentando sin filtro de nivel...")
+            print("⚠️ Sin ejercicios del nivel predicho. Intentando sin filtro de nivel...")
             where_sin_nivel  = [w for w in where if "e.nivel" not in w]
             where_clause_sin = ("WHERE " + " AND ".join(where_sin_nivel) if where_sin_nivel else "")
 
@@ -350,17 +514,17 @@ def ejercicio_siguiente():
 
         print(f"✅ Ejercicio seleccionado: id={id_ejercicio} nivel={nivel_ej} comp={id_competencia}")
 
-        imagen_url_bd = ejercicio.get("imagen_url")
-        print(f"🖼️ Ejercicio {ejercicio.get('id_ejercicio')} imagen_url en BD: {imagen_url_bd}")
+        # Nivel del estudiante para esta competencia (para mostrar en UI)
+        nivel_nec_ej, _     = leer_nec(cursor, id_estudiante, id_competencia)
+        nivel_est_competencia = nivel_display_texto(nivel_nec_ej)
 
+        imagen_url_bd = ejercicio.get("imagen_url")
         if imagen_url_bd:
-            base = request.host_url.rstrip("/")
-            nombre = os.path.basename(imagen_url_bd)
+            base       = request.host_url.rstrip("/")
+            nombre     = os.path.basename(imagen_url_bd)
             imagen_url = f"{base}/ejercicios/imagen/{nombre}"
         else:
             imagen_url = None
-
-        print(f"🖼️ URL final enviada a Android: {imagen_url}")
 
         cursor.execute("""
             SELECT id_opcion, letra, descripcion
@@ -383,17 +547,18 @@ def ejercicio_siguiente():
         pista = ejercicio["pista"] if modo == "repaso" else None
 
         return jsonify({
-            "status":         True,
-            "sinEjercicios":  False,
-            "idEjercicio":    id_ejercicio,
-            "idCompetencia":  id_competencia,
-            "enunciado":      ejercicio["enunciado"],
-            "imagenUrl":      imagen_url,
-            "opciones":       opciones,
-            "pista":          pista,
-            "modo":           modo,
-            "nivelEjercicio": nivel_ej,
-            "mensaje":        None,
+            "status":                     True,
+            "sinEjercicios":              False,
+            "idEjercicio":                id_ejercicio,
+            "idCompetencia":              id_competencia,
+            "enunciado":                  ejercicio["enunciado"],
+            "imagenUrl":                  imagen_url,
+            "opciones":                   opciones,
+            "pista":                      pista,
+            "modo":                       modo,
+            "nivelEjercicio":             nivel_ej,
+            "nivelEstudianteCompetencia": nivel_est_competencia,
+            "mensaje":                    None,
         }), 200
 
     except Exception as e:
@@ -401,13 +566,16 @@ def ejercicio_siguiente():
         return jsonify({"status": False, "error": str(e)}), 500
 
     finally:
+        try:
+            con.commit()   # persiste el INSERT de NEC hecho por leer_nec()
+        except Exception:
+            pass
         cursor.close()
         con.close()
 
 
 # =========================================================
 #  POST /tutor/responder
-#  ✅ Incluye materialSugerido cuando el estudiante falla
 # =========================================================
 @ws_tutor.route("/responder", methods=["POST"])
 def responder():
@@ -463,14 +631,18 @@ def responder():
               None, modo))
         id_respuesta = cursor.fetchone()["id_respuesta"]
 
-        # 3) Puntaje
-        puntaje = 100 if es_correcta else 0
-        cursor.execute("""
-            INSERT INTO puntajes (puntaje, id_competencia, id_estudiante)
-            VALUES (%s, %s, %s)
-        """, (puntaje, id_competencia, id_estudiante))
+        # 3) ── NÚCLEO: leer NEC ANTES de insertar puntaje_bin ──────────────
+        # (si se lee después, puntaje_bin=100/0 contamina el avg inicial)
+        nivel_actual_bd, score_actual = leer_nec(cursor, id_estudiante, id_competencia)
 
-        # 4) Progreso
+        # 4) Puntaje binario (para ML / historial)
+        puntaje_bin = 100 if es_correcta else 0
+        cursor.execute("""
+            INSERT INTO puntajes (puntaje, fecha_registro, id_competencia, id_estudiante)
+            VALUES (%s, NOW(), %s, %s)
+        """, (puntaje_bin, id_competencia, id_estudiante))
+
+        # 5) Progreso
         estado = "correcto" if es_correcta else "incorrecto"
         if uso_pista and es_repaso:
             estado += "_con_pista"
@@ -485,12 +657,62 @@ def responder():
               float(tiempo_respuesta) if tiempo_respuesta else None,
               id_estudiante, id_ejercicio, modo))
 
-        # 5) Progreso general
-        actualizar_progreso_estudiante(con, cursor, id_estudiante)
+        delta       = calcular_delta(es_correcta, tiempo_respuesta)
+        nuevo_score = max(0.0, min(100.0, score_actual + delta))
+        nuevo_nivel = score_to_nivel(nuevo_score)
 
-        # 6) Evaluación oficial
+        if es_repaso:
+            # Solo repaso actualiza el nivel adaptativo del alumno
+            guardar_nec(cursor, id_estudiante, id_competencia, nuevo_score, nuevo_nivel)
+            print(f"📈 NEC comp={id_competencia}: {score_actual:.1f}{delta:+d}={nuevo_score:.1f} → nivel {nuevo_nivel}")
+        else:
+            # Evaluación: el NEC no se modifica; usamos el nivel real para la respuesta
+            nuevo_nivel = nivel_actual_bd
+            nuevo_score = score_actual
+            print(f"📊 Evaluación comp={id_competencia}: NEC sin cambio, nivel={nivel_actual_bd}")
+
+        # Determinar ajuste y mensaje
+        if es_correcta:
+            if nuevo_nivel > nivel_actual_bd:
+                nuevo_ajuste = "mas_dificil"
+                mensaje = f"¡Subiste al nivel {NIVEL_NOMBRE.get(nuevo_nivel, str(nuevo_nivel))}!"
+            else:
+                nuevo_ajuste = "igual"
+                mensaje = "¡Correcto! Sigue practicando."
+            mostrar_pista = False
+        else:
+            if nuevo_nivel < nivel_actual_bd:
+                nuevo_ajuste = "mas_facil"
+                mensaje = "Ajustamos la dificultad para reforzar."
+            else:
+                nuevo_ajuste = "igual"
+                mensaje = "Sigue intentando, puedes lograrlo."
+            # Si ya está en N1 (mínimo posible) y tiene racha negativa (≥3 fallos seguidos)
+            # devolvemos "mas_facil" para que la app sepa que está atascado en el nivel base
+            if nuevo_nivel == 1 and nuevo_ajuste == "igual" and es_repaso:
+                racha_n1 = detectar_racha(cursor, id_estudiante, id_competencia, n=3)
+                if racha_n1 == "negativa":
+                    nuevo_ajuste = "mas_facil"
+                    mensaje = "Repasa los materiales de apoyo. ¡Toma tu tiempo!"
+            mostrar_pista = es_repaso
+
+        # Nivel global (promedio de las 4 competencias)
+        cursor.execute("""
+            SELECT COALESCE(AVG(nivel_actual), 1) AS prom
+            FROM nivel_estudiante_competencia
+            WHERE id_estudiante = %s AND id_competencia BETWEEN 1 AND 4
+        """, (id_estudiante,))
+        prom_g             = float((cursor.fetchone() or {}).get("prom") or 1)
+        nivel_global_texto = "bajo" if prom_g < 3 else "medio" if prom_g < 5 else "alto"
+
+        nivel_display_str = nivel_display_texto(nuevo_nivel)
+
+        # 6) Progreso general del estudiante (solo repaso actualiza NEC y progreso)
+        if es_repaso:
+            actualizar_progreso_estudiante(cursor, id_estudiante)
+
+        # 7) Evaluación oficial
         if not es_repaso and id_evaluacion:
-            # Detalle por pregunta para que el docente vea la respuesta del alumno
             cursor.execute("""
                 INSERT INTO evaluacion_respuestas
                     (id_evaluacion, id_estudiante, id_ejercicio, id_opcion, es_correcta, fecha)
@@ -517,60 +739,15 @@ def responder():
                   1 if es_correcta else 0,
                   100 if es_correcta else 0))
 
-        # 7) Predicción ML
-        nivel_ml_texto        = predecir_nivel_competencia(cursor, id_estudiante, id_competencia)
-        nivel_competencia_int = None
-        nivel_global_texto    = None
-
-        if nivel_ml_texto is not None:
-            nivel_competencia_int, nivel_global_texto = \
-                actualizar_nivel_estudiante_competencia(
-                    cursor, id_estudiante, id_competencia, nivel_ml_texto
-                )
-
-            if nivel_ml_texto == "alto":
-                nuevo_ajuste  = "mas_dificil"
-                mostrar_pista = False
-                mensaje       = "¡Vas muy bien! Subimos la dificultad."
-            elif nivel_ml_texto == "medio":
-                nuevo_ajuste  = "igual"
-                mostrar_pista = es_repaso and (not es_correcta)
-                mensaje       = "Mantendremos el nivel actual."
-            else:
-                nuevo_ajuste  = "mas_facil"
-                mostrar_pista = es_repaso
-                mensaje       = "Bajaremos la dificultad para reforzar."
-        else:
-            RAPIDO = 45
-            LENTO  = 90
-            t      = tiempo_respuesta or 0
-
-            if es_correcta:
-                nuevo_ajuste  = "mas_dificil" if t <= RAPIDO else "igual"
-                mostrar_pista = False
-                mensaje       = "¡Excelente!" if t <= RAPIDO else "Muy bien."
-            else:
-                nuevo_ajuste  = "mas_facil" if t > LENTO else "igual"
-                mostrar_pista = es_repaso
-                mensaje       = "Intentemos otro ejercicio."
-
-        # ✅ 8) Material sugerido — solo en repaso cuando el estudiante falla
-        # Busca material del módulo Dominio según el nivel y la competencia
+        # 8) Material sugerido (solo repaso + respuesta incorrecta)
         material_sugerido = None
         if es_repaso and not es_correcta:
             try:
-                # Nivel bajo → material nivel 1, medio → nivel 2, alto → nivel 3
-                nivel_mat = 1
-                if nivel_ml_texto == "medio":
-                    nivel_mat = 2
-                elif nivel_ml_texto == "alto":
-                    nivel_mat = 3
-
+                nivel_mat = 1 if nuevo_nivel <= 2 else (2 if nuevo_nivel <= 4 else 3)
                 cursor.execute("""
                     SELECT id_material, titulo, tipo, url
                     FROM material_estudio
-                    WHERE id_competencia = %s
-                      AND nivel <= %s
+                    WHERE id_competencia = %s AND nivel <= %s
                     ORDER BY RANDOM()
                     LIMIT 1
                 """, (id_competencia, nivel_mat))
@@ -594,10 +771,11 @@ def responder():
             "nuevoAjuste":         nuevo_ajuste,
             "idRespuesta":         id_respuesta,
             "modo":                modo,
-            "nivelMLCompetencia":  nivel_ml_texto,
-            "nivelCompetenciaInt": nivel_competencia_int,
+            "nivelMLCompetencia":  nivel_display_str,
+            "nivelCompetenciaInt": nuevo_nivel,
+            "scoreCompetencia":    round(nuevo_score, 1),
             "nivelGlobal":         nivel_global_texto,
-            "materialSugerido":    material_sugerido,   # ✅ NUEVO
+            "materialSugerido":    material_sugerido,
         }), 200
 
     except Exception as e:
@@ -670,24 +848,24 @@ def nivel_actual():
     con    = Conexion()
     cursor = con.cursor()
     try:
-        nivel_ml = predecir_nivel_competencia(cursor, id_estudiante, id_competencia)
-        cursor.execute("""
-            SELECT COUNT(*) AS total, AVG(puntaje) AS promedio
-            FROM puntajes
-            WHERE id_estudiante = %s AND id_competencia = %s
-        """, (id_estudiante, id_competencia))
-        row = cursor.fetchone() or {}
+        nivel_int, score = leer_nec(cursor, id_estudiante, id_competencia)
+        nivel_ml         = nivel_display_texto(nivel_int)
+        con.commit()  # guarda init si fue necesario
 
         return jsonify({
             "status":          True,
             "idEstudiante":    id_estudiante,
             "idCompetencia":   id_competencia,
             "nivelML":         nivel_ml,
-            "totalIntentos":   int(row.get("total") or 0),
-            "promedioPuntaje": float(row.get("promedio") or 0.0),
+            "nivelActual":     nivel_int,
+            "scoreActual":     round(score, 1),
+            "progresoActual":  nivel_to_progreso(nivel_int),
+            "totalIntentos":   0,
+            "promedioPuntaje": round(score, 1),
         }), 200
 
     except Exception as e:
+        con.rollback()
         return jsonify({"status": False, "error": str(e)}), 500
     finally:
         cursor.close()
@@ -706,10 +884,10 @@ def sugerencias_ejercicios(id_estudiante: int, id_competencia: int):
     try:
         nivel_ml = predecir_nivel_competencia(cursor, id_estudiante, id_competencia)
 
-        filtro = ""
-        if nivel_ml == "alto":    filtro = "AND e.nivel >= 2"
-        elif nivel_ml == "medio": filtro = "AND e.nivel BETWEEN 1 AND 2"
-        else:                     filtro = "AND e.nivel = 1"
+        # Usar los mismos umbrales que ejercicio_siguiente() para consistencia
+        _MAP = {"bajo": 1, "medio": 3, "alto": 5}
+        nivel_int = _MAP.get(nivel_ml, 1)
+        filtro = "AND " + NIVEL_EJERCICIO_WHERE.get(nivel_int, "e.nivel <= 3")
 
         cursor.execute(f"""
             SELECT e.id_ejercicio,
@@ -867,9 +1045,9 @@ def finalizar_evaluacion():
         cursor.close()
         con.close()
 
+
 # =========================================================
 #  POST /tutor/material/abrir
-#  ✅ Registra cuando el alumno abre el material sugerido
 # =========================================================
 @ws_tutor.route("/material/abrir", methods=["POST"])
 def registrar_apertura_material():
@@ -883,11 +1061,18 @@ def registrar_apertura_material():
     con    = Conexion()
     cursor = con.cursor()
     try:
-        # ✅ INSERT simple — todas las columnas son nullable, solo necesitamos estas
         cursor.execute("""
             INSERT INTO historial_material_estudio
                 (id_estudiante, id_material, estado, veces_revisado, fecha_acceso)
             VALUES (%s, %s, 'visto', 1, NOW())
+            ON CONFLICT (id_estudiante, id_material)
+            DO UPDATE SET
+                estado         = CASE
+                                   WHEN historial_material_estudio.estado = 'completado' THEN 'completado'
+                                   ELSE 'visto'
+                                 END,
+                veces_revisado = historial_material_estudio.veces_revisado + 1,
+                fecha_acceso   = NOW()
         """, (id_estudiante, id_material))
         con.commit()
         return jsonify({"ok": True}), 200

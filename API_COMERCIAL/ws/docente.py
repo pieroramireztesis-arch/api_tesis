@@ -1,5 +1,6 @@
 from flask import Blueprint, request, jsonify
 from models.Docente import Docente
+from models.scoring import nivel_to_progreso
 from conexionBD import Conexion
 import json
 
@@ -180,21 +181,20 @@ def docentes_alertas(id_docente):
         ids_est = [e["id_estudiante"] for e in estudiantes]
         nombres = {e["id_estudiante"]: e["nombre"] for e in estudiantes}
 
-        # 2) Promedio por competencia por alumno (una sola query)
+        # 2) Nivel por competencia por alumno desde NEC (fuente autoritativa)
         cur.execute("""
             SELECT
                 e.id_estudiante,
                 c.id_competencia,
                 c.descripcion,
-                COALESCE(AVG(p.puntaje), -1) AS promedio
+                COALESCE(nec.nivel_actual, 1) AS nivel_actual
             FROM estudiante e
             CROSS JOIN competencias c
-            LEFT JOIN puntajes p
-                   ON p.id_estudiante  = e.id_estudiante
-                  AND p.id_competencia = c.id_competencia
+            LEFT JOIN nivel_estudiante_competencia nec
+                   ON nec.id_estudiante  = e.id_estudiante
+                  AND nec.id_competencia = c.id_competencia
             WHERE e.id_estudiante = ANY(%s)
               AND c.id_competencia BETWEEN 1 AND 4
-            GROUP BY e.id_estudiante, c.id_competencia, c.descripcion
             ORDER BY e.id_estudiante, c.id_competencia
         """, (ids_est,))
         comp_rows = cur.fetchall() or []
@@ -232,13 +232,14 @@ def docentes_alertas(id_docente):
         # 4) Agrupar competencias con problema por alumno
         comp_map = {}
         for r in comp_rows:
-            id_est = r["id_estudiante"]
-            prom   = r.get("promedio")
-            if prom is not None and float(prom) >= 0 and float(prom) < 40:
+            id_est      = r["id_estudiante"]
+            nivel_actual = int(r.get("nivel_actual") or 1)
+            progreso_pct = nivel_to_progreso(nivel_actual)
+            if progreso_pct < 40:  # nivel 1 (0%) o nivel 2 (20%) → problema
                 comp_map.setdefault(id_est, []).append({
                     "idCompetencia": r["id_competencia"],
                     "nombre":        r["descripcion"],
-                    "promedio":      int(round(float(prom))),
+                    "promedio":      progreso_pct,
                     "nivel":         "bajo"
                 })
 
@@ -250,10 +251,13 @@ def docentes_alertas(id_docente):
             incorrectas     = err_data["incorrectas"]
             ultima_actividad = err_data["ultima_actividad"]
 
+            # Sin competencias en riesgo y menos de 3 fallos recientes → no alertar
             if not comps_problema and incorrectas < 3:
                 continue
 
-            tipo = "bajo_rendimiento" if comps_problema else "muchos_errores"
+            # muchos_errores tiene prioridad si hay ≥3 fallos recientes (más urgente)
+            # bajo_rendimiento si el nivel en las competencias es bajo aunque no falle tanto
+            tipo = "muchos_errores" if incorrectas >= 3 else "bajo_rendimiento"
             alertas.append({
                 "id_estudiante":        id_est,
                 "nombre":               nombres[id_est],

@@ -10,8 +10,8 @@ class Salon:
         cursor = con.cursor()
         try:
             cursor.execute("""
-                SELECT id_salon, nombre, grado, seccion, estado
-                FROM salon
+                SELECT id_salon, nombre_salon, grado
+                FROM salones
                 ORDER BY id_salon;
             """)
             datos = cursor.fetchall()
@@ -28,8 +28,8 @@ class Salon:
         cursor = con.cursor()
         try:
             cursor.execute("""
-                SELECT id_salon, nombre, grado, seccion, estado
-                FROM salon
+                SELECT id_salon, nombre_salon, grado
+                FROM salones
                 WHERE id_salon = %s;
             """, (id_salon,))
             dato = cursor.fetchone()
