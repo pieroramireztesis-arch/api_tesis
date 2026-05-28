@@ -39,6 +39,35 @@ app.config["JWT_SECRET_KEY"] = SecretKey.JWT_SECRET_KEY
 jwt = JWTManager(app)
 
 
+# ── Migraciones automáticas de columnas (se ejecuta una sola vez al arrancar) ──
+def _migrar_columnas_recursos():
+    """
+    Agrega palabras_clave a ejercicios y id_ejercicio a material_estudio
+    si aún no existen. Usa ADD COLUMN IF NOT EXISTS → idempotente.
+    """
+    try:
+        from conexionBD import Conexion
+        con = Conexion()
+        cur = con.cursor()
+        cur.execute(
+            "ALTER TABLE ejercicios "
+            "ADD COLUMN IF NOT EXISTS palabras_clave VARCHAR(200)"
+        )
+        cur.execute(
+            "ALTER TABLE material_estudio "
+            "ADD COLUMN IF NOT EXISTS id_ejercicio INTEGER "
+            "REFERENCES ejercicios(id_ejercicio) ON DELETE SET NULL"
+        )
+        con.commit()
+        cur.close()
+        con.close()
+        print("✅ Migración recursos: columnas listas")
+    except Exception as _e:
+        print(f"⚠️  Migración recursos (ignorado): {_e}")
+
+_migrar_columnas_recursos()
+
+
 app.register_blueprint(ws_estudiante)
 app.register_blueprint(ws_usuario)
 app.register_blueprint(ws_docente)

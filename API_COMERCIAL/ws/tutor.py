@@ -2,6 +2,7 @@
 import os
 import json
 import pickle
+import urllib.parse
 import numpy as np
 from flask import Blueprint, request, jsonify
 from werkzeug.utils import secure_filename
@@ -739,43 +740,94 @@ def responder():
                   1 if es_correcta else 0,
                   100 if es_correcta else 0))
 
-        # 8) Material sugerido (solo repaso + respuesta incorrecta)
-        material_sugerido = None
+        # 8) Material sugerido + recursos de búsqueda (solo repaso + respuesta incorrecta)
+        material_sugerido    = None
+        recursos_adicionales = None
         if es_repaso and not es_correcta:
             try:
                 nivel_mat = 1 if nuevo_nivel <= 2 else (2 if nuevo_nivel <= 4 else 3)
+
+                # ── Palabras clave del ejercicio (puestas por el docente) ────────
+                cursor.execute(
+                    "SELECT palabras_clave FROM ejercicios WHERE id_ejercicio = %s",
+                    (id_ejercicio,)
+                )
+                ej_row     = cursor.fetchone() or {}
+                palabras_clave = (ej_row.get("palabras_clave") or "").strip()
+
+                # Si el docente no llenó el campo, usamos términos fijos por competencia
+                if not palabras_clave:
+                    _KW_COMP = {
+                        1: "operaciones numéricas álgebra primaria",
+                        2: "ecuaciones algebraicas patrones álgebra",
+                        3: "geometría figuras movimiento espacial",
+                        4: "estadística datos gráficos probabilidad",
+                    }
+                    palabras_clave = _KW_COMP.get(id_competencia, "matemáticas álgebra")
+
+                # ── Capa 1: material específico enlazado al ejercicio ────────────
                 cursor.execute("""
                     SELECT id_material, titulo, tipo, url
                     FROM material_estudio
-                    WHERE id_competencia = %s AND nivel <= %s
-                    ORDER BY RANDOM()
-                    LIMIT 1
-                """, (id_competencia, nivel_mat))
+                    WHERE id_ejercicio = %s
+                    ORDER BY RANDOM() LIMIT 1
+                """, (id_ejercicio,))
                 mat = cursor.fetchone()
+
+                # ── Capa 2 (fallback): material genérico de la competencia ───────
+                if not mat:
+                    cursor.execute("""
+                        SELECT id_material, titulo, tipo, url
+                        FROM material_estudio
+                        WHERE id_competencia = %s
+                          AND nivel <= %s
+                          AND (id_ejercicio IS NULL OR id_ejercicio = 0)
+                        ORDER BY RANDOM() LIMIT 1
+                    """, (id_competencia, nivel_mat))
+                    mat = cursor.fetchone()
+
                 if mat:
                     material_sugerido = {
                         "idMaterial": mat["id_material"],
                         "titulo":     mat["titulo"],
                         "tipo":       mat["tipo"],
-                        "url":        mat["url"]
+                        "url":        mat["url"],
                     }
+
+                # ── URLs de búsqueda (YouTube · Web · PDF) ───────────────────────
+                # Se construyen con los términos conceptuales, NO con el enunciado
+                q_yt  = urllib.parse.quote_plus(palabras_clave + " matemáticas")
+                q_web = urllib.parse.quote_plus(
+                    palabras_clave + " matemáticas ejercicio resuelto"
+                )
+                q_pdf = urllib.parse.quote_plus(
+                    palabras_clave + " matemáticas recurso educativo filetype:pdf"
+                )
+                recursos_adicionales = {
+                    "youtubeUrl": f"https://www.youtube.com/results?search_query={q_yt}",
+                    "webUrl":     f"https://www.google.com/search?q={q_web}",
+                    "pdfUrl":     f"https://www.google.com/search?q={q_pdf}",
+                    "query":      palabras_clave,
+                }
+
             except Exception as e_mat:
-                print("Error buscando material:", e_mat)
+                print("Error buscando material/recursos:", e_mat)
 
         con.commit()
 
         return jsonify({
-            "correcta":            es_correcta,
-            "mostrarPista":        mostrar_pista,
-            "mensaje":             mensaje,
-            "nuevoAjuste":         nuevo_ajuste,
-            "idRespuesta":         id_respuesta,
-            "modo":                modo,
-            "nivelMLCompetencia":  nivel_display_str,
-            "nivelCompetenciaInt": nuevo_nivel,
-            "scoreCompetencia":    round(nuevo_score, 1),
-            "nivelGlobal":         nivel_global_texto,
-            "materialSugerido":    material_sugerido,
+            "correcta":             es_correcta,
+            "mostrarPista":         mostrar_pista,
+            "mensaje":              mensaje,
+            "nuevoAjuste":          nuevo_ajuste,
+            "idRespuesta":          id_respuesta,
+            "modo":                 modo,
+            "nivelMLCompetencia":   nivel_display_str,
+            "nivelCompetenciaInt":  nuevo_nivel,
+            "scoreCompetencia":     round(nuevo_score, 1),
+            "nivelGlobal":          nivel_global_texto,
+            "materialSugerido":     material_sugerido,
+            "recursosAdicionales":  recursos_adicionales,
         }), 200
 
     except Exception as e:

@@ -401,3 +401,176 @@ def frecuencia_uso(id_docente: int):
     finally:
         cur.close()
         con.close()
+
+
+# ========================================
+# ESTADÍSTICAS DE MATERIALES POR ESTUDIANTE
+# GET /dashboard/docente/<id_docente>/materiales-stats?id_estudiante=<id>
+# Usado por: panel web (reporte individual) + app móvil docente
+# ========================================
+@ws_dashboard.route('/docente/<int:id_docente>/materiales-stats', methods=['GET'])
+def materiales_stats(id_docente: int):
+    """
+    Devuelve estadísticas de revisión de materiales de estudio para
+    un estudiante específico del docente.
+
+    Query param: id_estudiante (obligatorio)
+
+    Respuesta:
+    {
+      "status": true,
+      "resumen": {
+        "totalRevisiones": 12,
+        "tiempoTotalSeg": 720,
+        "materialesDistintos": 5
+      },
+      "detalle": [
+        {
+          "titulo": "Interés simple - Khan Academy",
+          "tipo": "link",
+          "vecesRevisado": 3,
+          "tiempoVisto": 180,
+          "tiempoMin": 3
+        },
+        ...
+      ]
+    }
+    """
+    from flask import request as flask_request
+    id_estudiante = flask_request.args.get('id_estudiante', type=int)
+
+    if not id_estudiante:
+        return jsonify({"status": False, "message": "id_estudiante es obligatorio"}), 400
+
+    con = Conexion()
+    cur = con.cursor()
+    try:
+        # Verificar que el estudiante pertenece a un salón del docente
+        cur.execute("""
+            SELECT COUNT(*) AS cnt
+            FROM estudiante_salon es
+            JOIN salon s ON s.id_salon = es.id_salon
+            WHERE s.id_docente = %s
+              AND es.id_estudiante = %s
+        """, (id_docente, id_estudiante))
+        row = cur.fetchone()
+        if not row or (row.get('cnt') or 0) == 0:
+            return jsonify({"status": False, "message": "Estudiante no pertenece a tus salones"}), 403
+
+        # Estadísticas detalladas por material
+        cur.execute("""
+            SELECT
+                m.titulo,
+                m.tipo,
+                hm.veces_revisado,
+                COALESCE(hm.tiempo_visto, 0) AS tiempo_visto
+            FROM historial_material_estudio hm
+            JOIN material_estudio m ON m.id_material = hm.id_material
+            WHERE hm.id_estudiante = %s
+            ORDER BY hm.veces_revisado DESC, tiempo_visto DESC
+        """, (id_estudiante,))
+
+        rows = cur.fetchall() or []
+
+        detalle = [
+            {
+                "titulo":       r["titulo"],
+                "tipo":         r["tipo"],
+                "vecesRevisado": int(r["veces_revisado"] or 0),
+                "tiempoVisto":   int(r["tiempo_visto"]   or 0),
+                "tiempoMin":     round(int(r["tiempo_visto"] or 0) / 60, 1),
+            }
+            for r in rows
+        ]
+
+        total_revisiones = sum(d["vecesRevisado"] for d in detalle)
+        tiempo_total_seg = sum(d["tiempoVisto"]   for d in detalle)
+
+        return jsonify({
+            "status": True,
+            "resumen": {
+                "totalRevisiones":    total_revisiones,
+                "tiempoTotalSeg":     tiempo_total_seg,
+                "tiempoTotalMin":     round(tiempo_total_seg / 60, 1),
+                "materialesDistintos": len(detalle),
+            },
+            "detalle": detalle,
+        }), 200
+
+    except Exception as e:
+        print("Error en /dashboard/docente/materiales-stats:", str(e))
+        return jsonify({"status": False, "message": str(e)}), 500
+    finally:
+        cur.close()
+        con.close()
+
+
+# ========================================
+# ESTADÍSTICAS GLOBALES DE MATERIALES (salón)
+# GET /dashboard/docente/<id_docente>/materiales-salon?id_salon=<id>
+# Usado por: docente_dashboard.html (mini-card resumen del salón)
+# ========================================
+@ws_dashboard.route('/docente/<int:id_docente>/materiales-salon', methods=['GET'])
+def materiales_salon(id_docente: int):
+    """
+    Resumen global de revisión de materiales para todos los estudiantes
+    de un salón. Usado en el mini-card del dashboard del docente.
+
+    Query param: id_salon (obligatorio)
+    """
+    from flask import request as flask_request
+    id_salon = flask_request.args.get('id_salon', type=int)
+
+    if not id_salon:
+        return jsonify({"status": False, "message": "id_salon es obligatorio"}), 400
+
+    con = Conexion()
+    cur = con.cursor()
+    try:
+        # Verificar que el salón pertenece al docente
+        cur.execute(
+            "SELECT id_salon FROM salon WHERE id_salon = %s AND id_docente = %s",
+            (id_salon, id_docente)
+        )
+        if not cur.fetchone():
+            return jsonify({"status": False, "message": "Salón no encontrado"}), 403
+
+        cur.execute("""
+            SELECT
+                COUNT(DISTINCT hm.id_historial)  AS total_revisiones,
+                COUNT(DISTINCT hm.id_estudiante) AS estudiantes_activos,
+                SUM(COALESCE(hm.tiempo_visto, 0)) AS tiempo_total_seg,
+                u.nombre || ' ' || COALESCE(u.apellidos, '') AS nombre_mas_activo,
+                sub.rev_max
+            FROM estudiante_salon es
+            JOIN estudiante e   ON e.id_estudiante = es.id_estudiante
+            JOIN usuarios u     ON u.id_usuario    = e.id_usuario
+            LEFT JOIN historial_material_estudio hm ON hm.id_estudiante = e.id_estudiante
+            LEFT JOIN (
+                SELECT hm2.id_estudiante, SUM(hm2.veces_revisado) AS rev_max
+                FROM historial_material_estudio hm2
+                JOIN estudiante_salon es2 ON es2.id_estudiante = hm2.id_estudiante
+                WHERE es2.id_salon = %s
+                GROUP BY hm2.id_estudiante
+                ORDER BY rev_max DESC
+                LIMIT 1
+            ) sub ON sub.id_estudiante = e.id_estudiante
+            WHERE es.id_salon = %s
+        """, (id_salon, id_salon))
+
+        row = cur.fetchone() or {}
+
+        return jsonify({
+            "status":            True,
+            "totalRevisiones":   int(row.get("total_revisiones")  or 0),
+            "estudiantesActivos": int(row.get("estudiantes_activos") or 0),
+            "tiempoTotalMin":    round(int(row.get("tiempo_total_seg") or 0) / 60, 1),
+            "alumnoMasActivo":   (row.get("nombre_mas_activo") or "—").strip(),
+        }), 200
+
+    except Exception as e:
+        print("Error en /dashboard/docente/materiales-salon:", str(e))
+        return jsonify({"status": False, "message": str(e)}), 500
+    finally:
+        cur.close()
+        con.close()

@@ -56,12 +56,13 @@ def listar_ejercicios():
     try:
         cursor.execute(
             """
-            SELECT 
+            SELECT
                 e.id_ejercicio,
                 e.descripcion,
                 e.imagen_url,
                 e.respuesta_correcta,
                 e.pista,
+                e.palabras_clave,
                 c.id_competencia,
                 c.descripcion AS competencia,
                 c.area,
@@ -76,14 +77,15 @@ def listar_ejercicios():
 
         data = [
             {
-                "idEjercicio": r["id_ejercicio"],
-                "enunciado": r["descripcion"],
-                "imagenUrl": _imagen_url(r["imagen_url"]),
-                "respuestaCorrecta": r["respuesta_correcta"],
-                "pista": r["pista"],
-                "idCompetencia": r["id_competencia"],
-                "competencia": r["competencia"],
-                "area": r["area"],
+                "idEjercicio":      r["id_ejercicio"],
+                "enunciado":        r["descripcion"],
+                "imagenUrl":        _imagen_url(r["imagen_url"]),
+                "respuestaCorrecta":r["respuesta_correcta"],
+                "pista":            r["pista"],
+                "palabrasClave":    r["palabras_clave"],
+                "idCompetencia":    r["id_competencia"],
+                "competencia":      r["competencia"],
+                "area":             r["area"],
                 "nivelCompetencia": r["nivel"],
             }
             for r in rows
@@ -111,12 +113,13 @@ def obtener_ejercicio(id_ejercicio: int):
     try:
         cursor.execute(
             """
-            SELECT 
+            SELECT
                 e.id_ejercicio,
                 e.descripcion,
                 e.imagen_url,
                 e.respuesta_correcta,
                 e.pista,
+                e.palabras_clave,
                 c.id_competencia,
                 c.descripcion AS competencia,
                 c.area,
@@ -157,16 +160,17 @@ def obtener_ejercicio(id_ejercicio: int):
         imagen_norm = _normalizar_imagen_rel(ej["imagen_url"])
 
         data = {
-            "idEjercicio": ej["id_ejercicio"],
-            "enunciado": ej["descripcion"],
-            "imagenUrl": imagen_norm,
+            "idEjercicio":       ej["id_ejercicio"],
+            "enunciado":         ej["descripcion"],
+            "imagenUrl":         imagen_norm,
             "respuestaCorrecta": ej["respuesta_correcta"],
-            "pista": ej["pista"],
-            "idCompetencia": ej["id_competencia"],
-            "competencia": ej["competencia"],
-            "area": ej["area"],
-            "nivelCompetencia": ej["nivel"],
-            "opciones": opciones,
+            "pista":             ej["pista"],
+            "palabrasClave":     ej["palabras_clave"],
+            "idCompetencia":     ej["id_competencia"],
+            "competencia":       ej["competencia"],
+            "area":              ej["area"],
+            "nivelCompetencia":  ej["nivel"],
+            "opciones":          opciones,
         }
 
         return jsonify({"status": True, "data": data}), 200
