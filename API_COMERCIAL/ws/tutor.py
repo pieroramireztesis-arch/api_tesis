@@ -53,12 +53,25 @@ except Exception as e:
 # =========================================
 
 def calcular_features_competencia(cursor, id_estudiante, id_competencia):
+    """
+    7 features para el árbol de decisión:
+      total_intentos   — cuántas veces ha intentado
+      promedio_puntaje — promedio histórico (0-100)
+      min_puntaje      — peor resultado (detecta lagunas)
+      max_puntaje      — mejor resultado (techo alcanzado)
+      std_puntaje      — consistencia (std=0 → muy consistente)
+      tasa_aprobados   — fracción de intentos correctos
+      tendencia        — CORR(orden_temporal, puntaje): +1 mejorando / -1 empeorando
+    """
+    # ── Estadísticas globales ────────────────────────────────────────────
     cursor.execute("""
-        SELECT COUNT(*)  AS total_intentos,
-               AVG(puntaje)   AS promedio_puntaje,
-               MIN(puntaje)   AS min_puntaje,
-               MAX(puntaje)   AS max_puntaje,
-               SUM(CASE WHEN puntaje >= %s THEN 1 ELSE 0 END) AS num_aprobados
+        SELECT COUNT(*)                                              AS total_intentos,
+               AVG(puntaje)                                         AS promedio_puntaje,
+               MIN(puntaje)                                         AS min_puntaje,
+               MAX(puntaje)                                         AS max_puntaje,
+               COALESCE(STDDEV(puntaje), 0)                        AS std_puntaje,
+               SUM(CASE WHEN puntaje >= %s THEN 1 ELSE 0 END)      AS num_aprobados,
+               CORR(EXTRACT(EPOCH FROM fecha_registro), puntaje)   AS tendencia
         FROM puntajes
         WHERE id_estudiante = %s AND id_competencia = %s
     """, (UMBRAL_APROBADO, id_estudiante, id_competencia))
@@ -71,17 +84,24 @@ def calcular_features_competencia(cursor, id_estudiante, id_competencia):
     promedio  = row.get("promedio_puntaje")
     min_p     = row.get("min_puntaje")
     max_p     = row.get("max_puntaje")
+    std_p     = row.get("std_puntaje") or 0.0
     aprobados = row.get("num_aprobados") or 0
+    tendencia = row.get("tendencia")         # puede ser NULL si todos puntajes iguales
 
     if total == 0 or promedio is None:
         return None
 
-    promedio = max(0.0, min(100.0, float(promedio)))
-    min_p    = max(0.0, min(100.0, float(min_p or 0)))
-    max_p    = max(0.0, min(100.0, float(max_p or 0)))
-    tasa     = float(aprobados) / float(total)
+    promedio  = max(0.0, min(100.0, float(promedio)))
+    min_p     = max(0.0, min(100.0, float(min_p or 0)))
+    max_p     = max(0.0, min(100.0, float(max_p or 0)))
+    std_p     = max(0.0, float(std_p))
+    tasa      = float(aprobados) / float(total)
+    tendencia = float(tendencia) if tendencia is not None else 0.0
+    # CORR puede estar fuera de [-1,1] por redondeo numérico → clampear
+    tendencia = max(-1.0, min(1.0, tendencia))
 
-    return np.array([[float(total), promedio, min_p, max_p, tasa]], dtype=float)
+    return np.array([[float(total), promedio, min_p, max_p, std_p, tasa, tendencia]],
+                    dtype=float)
 
 
 def leer_nec(cursor, id_estudiante, id_competencia):

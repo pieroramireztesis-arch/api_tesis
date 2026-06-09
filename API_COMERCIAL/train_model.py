@@ -30,6 +30,24 @@ UMBRAL_MEDIO    = 70.0
 
 
 def cargar_datos_desde_bd():
+    """
+    Carga datos de puntajes y construye el dataset con 7 features:
+
+      total_intentos   — cuántas veces ha intentado en esa competencia
+      promedio_puntaje — promedio histórico (0-100)
+      min_puntaje      — peor resultado (detecta lagunas)
+      max_puntaje      — mejor resultado (techo alcanzado)
+      std_puntaje      — desviación estándar (consistencia del alumno)
+      tasa_aprobados   — fracción de intentos aprobados (puntaje >= umbral)
+      tendencia        — CORR(tiempo, puntaje): +1 mejorando / -1 empeorando
+
+    La tendencia y la std capturan patrones de comportamiento REALES que el
+    promedio por sí solo no puede ver:
+      - Dos alumnos con promedio=60 pero uno mejorando (tendencia>0) y otro
+        empeorando (tendencia<0) deben recibir ejercicios distintos.
+      - Un alumno inconsistente (std alto) con buen promedio puede necesitar
+        más práctica antes de avanzar.
+    """
     con = Conexion()
     cur = con.cursor()
 
@@ -37,11 +55,13 @@ def cargar_datos_desde_bd():
         SELECT
             p.id_estudiante,
             p.id_competencia,
-            COUNT(*)        AS total_intentos,
-            AVG(p.puntaje)  AS promedio_puntaje,
-            MIN(p.puntaje)  AS min_puntaje,
-            MAX(p.puntaje)  AS max_puntaje,
-            SUM(CASE WHEN p.puntaje >= %s THEN 1 ELSE 0 END) AS num_aprobados
+            COUNT(*)                                               AS total_intentos,
+            AVG(p.puntaje)                                        AS promedio_puntaje,
+            MIN(p.puntaje)                                        AS min_puntaje,
+            MAX(p.puntaje)                                        AS max_puntaje,
+            COALESCE(STDDEV(p.puntaje), 0)                       AS std_puntaje,
+            SUM(CASE WHEN p.puntaje >= %s THEN 1 ELSE 0 END)     AS num_aprobados,
+            CORR(EXTRACT(EPOCH FROM p.fecha_registro), p.puntaje) AS tendencia
         FROM puntajes p
         GROUP BY p.id_estudiante, p.id_competencia
         HAVING COUNT(*) >= 1
@@ -59,75 +79,99 @@ def cargar_datos_desde_bd():
         promedio  = row["promedio_puntaje"]
         min_p     = row["min_puntaje"]
         max_p     = row["max_puntaje"]
+        std_p     = row["std_puntaje"] or 0.0
         aprobados = row["num_aprobados"] or 0
+        tendencia = row["tendencia"]          # None si todos iguales
 
         if promedio is None or total == 0:
             continue
 
-        promedio = max(0.0, min(100.0, float(promedio)))
-        min_p    = max(0.0, min(100.0, float(min_p)))
-        max_p    = max(0.0, min(100.0, float(max_p)))
-        tasa     = float(aprobados) / float(total)
+        promedio  = max(0.0, min(100.0, float(promedio)))
+        min_p     = max(0.0, min(100.0, float(min_p)))
+        max_p     = max(0.0, min(100.0, float(max_p)))
+        std_p     = max(0.0, float(std_p))
+        tasa      = float(aprobados) / float(total)
+        tendencia = float(tendencia) if tendencia is not None else 0.0
+        tendencia = max(-1.0, min(1.0, tendencia))   # clamping por seguridad
 
-        if promedio < UMBRAL_BAJO:
-            nivel = "bajo"
-        elif promedio < UMBRAL_MEDIO:
-            nivel = "medio"
-        else:
+        # ── Etiqueta multi-feature (rompe la dependencia circular) ──────────
+        #
+        # Antes: nivel = f(promedio) únicamente → el árbol aprendía el umbral
+        #        de promedio, lo que es CIRCULAR (promedio ES la definición).
+        #
+        # Ahora: la etiqueta depende de TRES señales independientes:
+        #   · tasa_aprobados  (correctas / total)
+        #   · tendencia       (¿está mejorando o empeorando?)
+        #   · total_intentos  (¿tiene suficiente historial?)
+        #
+        # Reglas pedagógicas:
+        #   "alto"  → tasa ≥ 0.70  Y  no está empeorando claramente
+        #             → el alumno domina Y mantiene o mejora su rendimiento
+        #   "bajo"  → tasa < 0.35
+        #             O (tasa < 0.55 Y tendencia < -0.30)
+        #             → alumno con dificultades O que está retrocediendo
+        #   "medio" → todo lo demás (rendimiento aceptable / en transición)
+        #
+        # Efecto: dos alumnos con el mismo promedio pero trayectorias opuestas
+        # reciben etiquetas distintas, forzando al árbol a aprender de tendencia.
+        if tasa >= 0.70 and tendencia >= -0.30:
             nivel = "alto"
+        elif tasa < 0.35 or (tasa < 0.55 and tendencia < -0.30):
+            nivel = "bajo"
+        else:
+            nivel = "medio"
 
-        X.append([float(total), promedio, min_p, max_p, tasa])
+        X.append([float(total), promedio, min_p, max_p, std_p, tasa, tendencia])
         y.append(nivel)
 
-    # ✅ NUEVO: si hay muy pocas muestras de alguna clase,
-    # agregamos datos sintéticos balanceados para que el modelo
-    # aprenda todos los niveles
+    # ── Balanceo con datos sintéticos si alguna clase tiene < MIN_MUESTRAS ────
     conteo = {"bajo": 0, "medio": 0, "alto": 0}
     for nivel in y:
         conteo[nivel] += 1
 
-    print("📊 Distribución real de datos:", conteo)
+    print("📊 Distribución REAL de datos:", conteo)
 
-    # Si alguna clase tiene menos de 5 muestras, agregar sintéticos
     MIN_MUESTRAS = 10
 
+    def _sint(prom_range, min_range, max_range, std_range, tasa_range, tend_range):
+        total_s    = np.random.randint(3, 20)
+        promedio_s = np.random.uniform(*prom_range)
+        min_s      = np.random.uniform(*min_range)
+        max_s      = np.random.uniform(*max_range)
+        std_s      = np.random.uniform(*std_range)
+        tasa_s     = np.random.uniform(*tasa_range)
+        tend_s     = np.random.uniform(*tend_range)
+        return [float(total_s), promedio_s, min_s, max_s, std_s, tasa_s, tend_s]
+
     if conteo["alto"] < MIN_MUESTRAS:
-        print(f"⚠️ Pocos datos 'alto' ({conteo['alto']}). Agregando sintéticos...")
-        for _ in range(MIN_MUESTRAS - conteo["alto"]):
-            total_s   = np.random.randint(5, 20)
-            promedio_s = np.random.uniform(70, 100)
-            min_s      = np.random.uniform(60, 80)
-            max_s      = np.random.uniform(85, 100)
-            tasa_s     = np.random.uniform(0.7, 1.0)
-            X.append([float(total_s), promedio_s, min_s, max_s, tasa_s])
+        n = MIN_MUESTRAS - conteo["alto"]
+        print(f"⚠️  Pocos datos 'alto' ({conteo['alto']}). Agregando {n} sintéticos...")
+        for _ in range(n):
+            X.append(_sint((70,100),(55,80),(85,100),(0,20),(0.7,1.0),(0.0,1.0)))
             y.append("alto")
 
     if conteo["medio"] < MIN_MUESTRAS:
-        print(f"⚠️ Pocos datos 'medio' ({conteo['medio']}). Agregando sintéticos...")
-        for _ in range(MIN_MUESTRAS - conteo["medio"]):
-            total_s   = np.random.randint(3, 15)
-            promedio_s = np.random.uniform(40, 70)
-            min_s      = np.random.uniform(20, 50)
-            max_s      = np.random.uniform(60, 85)
-            tasa_s     = np.random.uniform(0.3, 0.7)
-            X.append([float(total_s), promedio_s, min_s, max_s, tasa_s])
+        n = MIN_MUESTRAS - conteo["medio"]
+        print(f"⚠️  Pocos datos 'medio' ({conteo['medio']}). Agregando {n} sintéticos...")
+        for _ in range(n):
+            X.append(_sint((40,70),(20,55),(60,85),(5,35),(0.3,0.7),(-0.3,0.3)))
             y.append("medio")
 
     if conteo["bajo"] < MIN_MUESTRAS:
-        print(f"⚠️ Pocos datos 'bajo' ({conteo['bajo']}). Agregando sintéticos...")
-        for _ in range(MIN_MUESTRAS - conteo["bajo"]):
-            total_s   = np.random.randint(1, 10)
-            promedio_s = np.random.uniform(0, 40)
-            min_s      = np.random.uniform(0, 30)
-            max_s      = np.random.uniform(20, 50)
-            tasa_s     = np.random.uniform(0.0, 0.3)
-            X.append([float(total_s), promedio_s, min_s, max_s, tasa_s])
+        n = MIN_MUESTRAS - conteo["bajo"]
+        print(f"⚠️  Pocos datos 'bajo' ({conteo['bajo']}). Agregando {n} sintéticos...")
+        for _ in range(n):
+            X.append(_sint((0,40),(0,25),(20,55),(0,15),(0.0,0.3),(-1.0,0.2)))
             y.append("bajo")
+
+    if sum(1 for nivel in y if nivel != y[0]) == 0:
+        print("Solo hay una clase. No se puede entrenar.")
+        return np.array([], dtype=float), np.array([], dtype=object)
 
     X = np.array(X, dtype=float)
     y = np.array(y, dtype=object)
 
-    print(f"✅ Total muestras (reales + sintéticas): {len(X)}")
+    print(f"✅ Total muestras (reales + sintéticas si hubo): {len(X)}")
     return X, y
 
 
@@ -149,7 +193,8 @@ def entrenar_modelo():
 
     feature_names = [
         "total_intentos", "promedio_puntaje",
-        "min_puntaje", "max_puntaje", "tasa_aprobados"
+        "min_puntaje", "max_puntaje",
+        "std_puntaje", "tasa_aprobados", "tendencia"
     ]
 
     # ── Split train/test ───────────────────────────────────────
@@ -268,12 +313,15 @@ def entrenar_modelo():
     print(f"\n{'='*55}")
     print("  PREDICCIONES DE EJEMPLO (perfiles de estudiante)")
     print(f"{'='*55}")
+    # [total, promedio, min, max, std, tasa, tendencia]
     perfiles = [
-        ([2,  15.0, 10.0, 20.0, 0.0],  "Estudiante nuevo, puntajes muy bajos"),
-        ([5,  35.0, 20.0, 45.0, 0.1],  "Pocos intentos, promedio bajo"),
-        ([8,  55.0, 40.0, 70.0, 0.5],  "Regular, mitad aprobados"),
-        ([12, 72.0, 60.0, 88.0, 0.75], "Buen promedio, mayoría aprobados"),
-        ([15, 91.0, 80.0, 100.0, 1.0], "Excelente, todos aprobados"),
+        ([2,  15.0, 10.0, 20.0, 5.0,  0.0,  0.0],  "Nuevo, puntajes muy bajos, sin tendencia"),
+        ([5,  35.0, 20.0, 45.0, 10.0, 0.1, -0.3],  "Promedio bajo y empeorando"),
+        ([8,  55.0, 40.0, 70.0, 15.0, 0.5,  0.0],  "Regular, consistente, estable"),
+        ([10, 58.0, 30.0, 90.0, 30.0, 0.5,  0.4],  "Promedio medio pero mejorando y volátil"),
+        ([12, 72.0, 60.0, 88.0, 8.0,  0.75, 0.6],  "Buen promedio, consistente, mejorando"),
+        ([15, 72.0, 50.0, 95.0, 25.0, 0.6, -0.5],  "Buen promedio PERO empeorando y volátil"),
+        ([15, 91.0, 80.0, 100.0, 5.0, 1.0,  0.8],  "Excelente, consistente, mejorando"),
     ]
     print(f"  {'Perfil':<40} {'Pred':^8} {'Prob bajo':^10} {'Prob medio':^11} {'Prob alto':^10}")
     print(f"  {'-'*40} {'-'*8} {'-'*10} {'-'*11} {'-'*10}")
