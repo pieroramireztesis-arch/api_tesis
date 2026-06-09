@@ -15,7 +15,14 @@ from models.scoring import (
 ws_tutor = Blueprint("ws_tutor", __name__, url_prefix="/tutor")
 
 BASE_DIR = os.path.dirname(os.path.dirname(__file__))
-DESARROLLOS_FOLDER = os.path.join(BASE_DIR, "static", "desarrollos_alumno")
+
+# En Railway: apuntar a un volumen persistente mediante la variable DESARROLLOS_ALUMNO_PATH
+# Ej: DESARROLLOS_ALUMNO_PATH=/mnt/desarrollos
+# En local: usa la carpeta static/desarrollos_alumno/ (ya tiene fotos de prueba)
+DESARROLLOS_FOLDER = os.getenv(
+    "DESARROLLOS_ALUMNO_PATH",
+    os.path.join(BASE_DIR, "static", "desarrollos_alumno")
+)
 os.makedirs(DESARROLLOS_FOLDER, exist_ok=True)
 
 UMBRAL_APROBADO = 60.0

@@ -121,8 +121,21 @@ def servir_imagen_ejercicio(filename):
 
 @app.route('/desarrollos/imagen/<filename>')
 def servir_imagen_desarrollo(filename):
-    """Sirve las fotos del desarrollo del alumno para la app web (Railway)."""
-    return _servir_imagen(_DESARROLLOS_ALUMNO, filename)
+    """
+    Sirve las fotos del desarrollo del alumno.
+    Busca en este orden:
+      1. _DESARROLLOS_ALUMNO  (Railway Volume o carpeta configurada por env var)
+      2. static/desarrollos_alumno/ del repo (fotos comprometidas en git, datos de demo)
+    Así funcionan tanto las fotos antiguas (en git) como las nuevas (en el volumen).
+    """
+    # 1. Carpeta principal (Railway Volume cuando DESARROLLOS_ALUMNO_PATH está seteada)
+    ruta_principal = os.path.join(_DESARROLLOS_ALUMNO, filename)
+    if os.path.exists(ruta_principal):
+        return _servir_imagen(_DESARROLLOS_ALUMNO, filename)
+
+    # 2. Fallback: carpeta estática del repo (datos de demo comprometidos en git)
+    static_git = os.path.join(BASE_DIR, "static", "desarrollos_alumno")
+    return _servir_imagen(static_git, filename)
 
 
 @app.route('/')
