@@ -48,6 +48,36 @@ NIVEL_NOMBRE = {
     7: "Maestro",
 }
 
+# ── Nivel interno (1-7) → nivel MINEDU oficial (EBR) ───────────────────────
+# Fuente: MINEDU Currículo Nacional 2016, Escala de calificación EBR.
+# El STI usa 7 sub-niveles de granularidad fina para el ajuste adaptativo;
+# MINEDU define 5 niveles de reporte oficial para comunicar al docente.
+#
+#  STI interno  │ Score  │ Nivel MINEDU
+#  ─────────────┼────────┼─────────────────────
+#   1 Iniciando │  0-21  │ Previo al inicio
+#   2 Básico    │ 22-35  │ En inicio
+#   3 En progr. │ 36-49  │ En proceso
+#   4 Intermedio│ 50-64  │ En proceso
+#   5 Avanzado  │ 65-78  │ Logrado
+#   6 Experto   │ 79-92  │ Logrado
+#   7 Maestro   │ 93-100 │ Destacado
+NIVEL_MINEDU = {
+    1: "Previo al inicio",
+    2: "En inicio",
+    3: "En proceso",
+    4: "En proceso",
+    5: "Logrado",
+    6: "Logrado",
+    7: "Destacado",
+}
+
+
+def nivel_to_minedu(nivel: int) -> str:
+    """Retorna el nombre del nivel MINEDU oficial para un nivel interno (1-7)."""
+    return NIVEL_MINEDU.get(int(nivel or 1), "Previo al inicio")
+
+
 # ── Nivel → texto UI del tutor (bajo/medio/alto) ────────────────────────────
 # "bajo" → "en construcción" en Android
 NIVEL_DISPLAY = {

@@ -1,19 +1,23 @@
 from flask import Blueprint, request, jsonify
 from conexionBD import Conexion
-import secrets, string, smtplib
+import os, secrets, string, smtplib
 from email.message import EmailMessage
-from flask_jwt_extended import create_access_token
+from flask_jwt_extended import create_access_token, jwt_required, get_jwt_identity
 from werkzeug.security import generate_password_hash, check_password_hash
 
 ws_auth = Blueprint('ws_auth', __name__)
 
 # ==========================================
 # CONFIGURACIÓN DEL CORREO EMISOR
+# ⚠️  NUNCA pongas credenciales reales aquí (quedan en Git).
+#     Define estas variables en Railway / .env local:
+#       SMTP_USER=tu@gmail.com
+#       SMTP_PASS=xxxx xxxx xxxx xxxx   ← App Password de Gmail
 # ==========================================
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 465
-SMTP_USER = "ww.sco.lol@gmail.com"
-SMTP_PASS = "ldea bxfz fqns zpjx"
+SMTP_USER = os.environ.get("SMTP_USER", "")
+SMTP_PASS = os.environ.get("SMTP_PASS", "")
 # ==========================================
 
 
@@ -238,6 +242,16 @@ def recuperar_contrasena():
             f"Equipo del Sistema de Álgebra"
         )
 
+        # Guard: si las credenciales SMTP no están configuradas, abortar antes
+        # de tocar la BD (igual que el fix en el proyecto web).
+        if not SMTP_USER or not SMTP_PASS:
+            cur.close()
+            con.close()
+            return jsonify({
+                'status': False,
+                'message': 'El sistema de correo no está configurado. Contacta al administrador.'
+            }), 503
+
         msg = EmailMessage()
         msg["Subject"] = asunto
         msg["From"]    = SMTP_USER
@@ -278,15 +292,23 @@ def recuperar_contrasena():
 
 # -------------------------------------------------------------------
 # CAMBIAR PASSWORD MANUAL
+# ⚠️  REQUIERE JWT — el usuario solo puede cambiar SU PROPIA contraseña.
+#     El id_usuario del body se ignora; se usa el del token para evitar
+#     que un atacante cambie la contraseña de otro usuario.
 # -------------------------------------------------------------------
 @ws_auth.route('/auth/cambiar_password', methods=['PUT'])
+@jwt_required()
 def cambiar_password():
-    data      = request.get_json() or {}
-    id_usuario = data.get('id_usuario')
-    nueva     = data.get('nueva_password')
+    # Identidad del token (id_usuario como string)
+    current_id = int(get_jwt_identity())
 
-    if not id_usuario or not nueva:
-        return jsonify({'status': False, 'message': 'Faltan campos'}), 400
+    data  = request.get_json() or {}
+    nueva = data.get('nueva_password') or data.get('nueva')
+
+    if not nueva:
+        return jsonify({'status': False, 'message': 'Falta nueva_password'}), 400
+    if len(str(nueva)) < 6:
+        return jsonify({'status': False, 'message': 'La contraseña debe tener al menos 6 caracteres'}), 400
 
     con = Conexion()
     cur = con.cursor()
@@ -294,7 +316,7 @@ def cambiar_password():
         hash_contra = generate_password_hash(nueva)
         cur.execute(
             "UPDATE usuarios SET contrasena=%s WHERE id_usuario=%s",
-            (hash_contra, id_usuario)
+            (hash_contra, current_id)
         )
         con.commit()
         return jsonify({

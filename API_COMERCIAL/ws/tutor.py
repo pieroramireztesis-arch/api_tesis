@@ -659,18 +659,10 @@ def responder():
               None, modo))
         id_respuesta = cursor.fetchone()["id_respuesta"]
 
-        # 3) ── NÚCLEO: leer NEC ANTES de insertar puntaje_bin ──────────────
-        # (si se lee después, puntaje_bin=100/0 contamina el avg inicial)
+        # 3) ── NÚCLEO: leer NEC ────────────────────────────────────────────
         nivel_actual_bd, score_actual = leer_nec(cursor, id_estudiante, id_competencia)
 
-        # 4) Puntaje binario (para ML / historial)
-        puntaje_bin = 100 if es_correcta else 0
-        cursor.execute("""
-            INSERT INTO puntajes (puntaje, fecha_registro, id_competencia, id_estudiante)
-            VALUES (%s, NOW(), %s, %s)
-        """, (puntaje_bin, id_competencia, id_estudiante))
-
-        # 5) Progreso
+        # 4) Progreso (registro de actividad — siempre, independiente del modo)
         estado = "correcto" if es_correcta else "incorrecto"
         if uso_pista and es_repaso:
             estado += "_con_pista"
@@ -690,7 +682,14 @@ def responder():
         nuevo_nivel = score_to_nivel(nuevo_score)
 
         if es_repaso:
-            # Solo repaso actualiza el nivel adaptativo del alumno
+            # 5a) Puntaje binario → SOLO repaso alimenta el historial del ML.
+            #     Evaluación es medición, no entrenamiento: no debe contaminar puntajes.
+            puntaje_bin = 100 if es_correcta else 0
+            cursor.execute("""
+                INSERT INTO puntajes (puntaje, fecha_registro, id_competencia, id_estudiante)
+                VALUES (%s, NOW(), %s, %s)
+            """, (puntaje_bin, id_competencia, id_estudiante))
+            # 5b) Actualizar nivel adaptativo del alumno
             guardar_nec(cursor, id_estudiante, id_competencia, nuevo_score, nuevo_nivel)
             print(f"📈 NEC comp={id_competencia}: {score_actual:.1f}{delta:+d}={nuevo_score:.1f} → nivel {nuevo_nivel}")
         else:

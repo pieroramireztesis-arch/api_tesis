@@ -19,8 +19,9 @@ class Config:
 
 
 class SecretKey:
-    # ⚠️  Cambia esto con la variable JWT_SECRET_KEY en Railway/producción
-    JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "claveSuperSecreta2025")
+    # ⚠️  En producción (Railway) define JWT_SECRET_KEY con un valor largo y aleatorio.
+    #     Con el default de desarrollo los tokens pueden ser forjados si alguien lo conoce.
+    JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "dev-only-jwt-tutormath2026-CHANGE-IN-PROD")
 
 
 class Host:

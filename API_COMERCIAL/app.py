@@ -102,12 +102,21 @@ print("📁 Desarrollos alumno:", _DESARROLLOS_ALUMNO, "| existe:", os.path.exis
 
 
 def _servir_imagen(carpeta, filename):
-    """Sirve un archivo de imagen desde la carpeta indicada."""
+    """
+    Sirve un archivo de imagen desde la carpeta indicada.
+    Previene path traversal: solo acepta nombres de archivo sin subdirectorios.
+    """
     try:
-        filepath = os.path.join(carpeta, filename)
+        # Sanear filename: eliminar cualquier componente de directorio (../../ etc.)
+        safe_name = os.path.basename(filename)
+        if not safe_name or safe_name != filename:
+            # El filename original contenía barras u otros componentes → rechazar
+            return jsonify({"error": "Nombre de archivo inválido"}), 400
+
+        filepath = os.path.join(carpeta, safe_name)
         if not os.path.exists(filepath):
             return jsonify({"error": "Imagen no encontrada"}), 404
-        mime_type, _ = mimetypes.guess_type(filename)
+        mime_type, _ = mimetypes.guess_type(safe_name)
         mime_type = mime_type or 'image/jpeg'
         return send_file(filepath, mimetype=mime_type, max_age=3600)
     except Exception as e:

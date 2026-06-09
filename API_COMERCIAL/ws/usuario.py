@@ -28,8 +28,7 @@ def login_usuario():
     cur = con.cursor()
 
     try:
-        print("LOGIN:", correo, contrasena)
-
+        # ⚠️  print eliminado: logueaba la contraseña en texto plano.
         cur.execute("""
             SELECT 
                 u.id_usuario,
