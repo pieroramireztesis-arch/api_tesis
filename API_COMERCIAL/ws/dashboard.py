@@ -448,9 +448,9 @@ def materiales_stats(id_docente: int):
         # Verificar que el estudiante pertenece a un salón del docente
         cur.execute("""
             SELECT COUNT(*) AS cnt
-            FROM estudiante_salon es
-            JOIN salon s ON s.id_salon = es.id_salon
-            WHERE s.id_docente = %s
+            FROM estudiante_salones es
+            JOIN docente_salones ds ON ds.id_salon = es.id_salon
+            WHERE ds.id_docente = %s
               AND es.id_estudiante = %s
         """, (id_docente, id_estudiante))
         row = cur.fetchone()
@@ -527,9 +527,9 @@ def materiales_salon(id_docente: int):
     con = Conexion()
     cur = con.cursor()
     try:
-        # Verificar que el salón pertenece al docente
+        # Verificar que el salón pertenece al docente (vía docente_salones)
         cur.execute(
-            "SELECT id_salon FROM salon WHERE id_salon = %s AND id_docente = %s",
+            "SELECT id_salon FROM docente_salones WHERE id_salon = %s AND id_docente = %s",
             (id_salon, id_docente)
         )
         if not cur.fetchone():
@@ -542,14 +542,14 @@ def materiales_salon(id_docente: int):
                 SUM(COALESCE(hm.tiempo_visto, 0)) AS tiempo_total_seg,
                 u.nombre || ' ' || COALESCE(u.apellidos, '') AS nombre_mas_activo,
                 sub.rev_max
-            FROM estudiante_salon es
+            FROM estudiante_salones es
             JOIN estudiante e   ON e.id_estudiante = es.id_estudiante
             JOIN usuarios u     ON u.id_usuario    = e.id_usuario
             LEFT JOIN historial_material_estudio hm ON hm.id_estudiante = e.id_estudiante
             LEFT JOIN (
                 SELECT hm2.id_estudiante, SUM(hm2.veces_revisado) AS rev_max
                 FROM historial_material_estudio hm2
-                JOIN estudiante_salon es2 ON es2.id_estudiante = hm2.id_estudiante
+                JOIN estudiante_salones es2 ON es2.id_estudiante = hm2.id_estudiante
                 WHERE es2.id_salon = %s
                 GROUP BY hm2.id_estudiante
                 ORDER BY rev_max DESC
