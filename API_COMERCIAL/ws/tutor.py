@@ -856,8 +856,15 @@ def subir_desarrollo():
     ruta_fisica = os.path.join(DESARROLLOS_FOLDER, filename)
 
     try:
-        archivo.save(ruta_fisica)
-        url_abs = (request.host_url.rstrip("/") + f"/static/desarrollos_alumno/{filename}")
+        # ── Subida a Cloudinary (Railway) o filesystem (local) ──────────
+        from util_cloudinary import cloudinary_configurado, subir_imagen
+        if cloudinary_configurado():
+            public_id = f"tutormath/desarrollos/resp_{id_respuesta}"
+            url_abs   = subir_imagen(archivo, public_id)
+        else:
+            # Modo local: guardar en disco
+            archivo.save(ruta_fisica)
+            url_abs = (request.host_url.rstrip("/") + f"/static/desarrollos_alumno/{filename}")
 
         con    = Conexion()
         cursor = con.cursor()

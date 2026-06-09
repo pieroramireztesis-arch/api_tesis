@@ -8,6 +8,10 @@ import os
 def _imagen_url(raw: str | None) -> str | None:
     if not raw:
         return None
+    # URL completa (Cloudinary, etc.) → se devuelve tal cual
+    if raw.startswith("http://") or raw.startswith("https://"):
+        return raw
+    # Ruta legacy (/static/... o solo filename) → sirve via endpoint local
     return "/ejercicios/imagen/" + os.path.basename(raw)
 
 ws_ejercicio = Blueprint("ws_ejercicio", __name__, url_prefix="/ejercicios")

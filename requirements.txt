@@ -4,6 +4,7 @@ psycopg2-binary==2.9.10
 gunicorn==23.0.0
 python-dotenv==1.0.1
 bcrypt==5.0.0
+cloudinary==1.44.2
 
 # Modelo de tutor inteligente (árbol de decisión)
 numpy==2.3.3
