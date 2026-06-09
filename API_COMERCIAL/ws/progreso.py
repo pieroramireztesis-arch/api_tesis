@@ -406,3 +406,97 @@ def progreso_chart():
     finally:
         cur.close()
         con.close()
+
+
+# ==========================
+#  GET /progreso/tiempo_por_nivel?idEstudiante=4
+#
+#  Devuelve el tiempo promedio de respuesta y la tasa de acierto
+#  agrupados por nivel de dificultad del ejercicio (N1..N4).
+#
+#  Usado por: ProgresoFragment y TeacherStudentReportActivity
+#  para mostrar cuánto tarda el alumno según la dificultad.
+#
+#  Respuesta:
+#  {
+#    "status": true,
+#    "niveles": [
+#      {
+#        "nivelEjercicio": 1,
+#        "nombreNivel":    "Fácil",
+#        "promedioSeg":    148.5,
+#        "promedioFormato":"2m 28s",
+#        "totalRespuestas": 12,
+#        "tasaAcierto":    0.83
+#      },
+#      ...
+#    ]
+#  }
+# ==========================
+@ws_progreso.route('/tiempo_por_nivel', methods=['GET'])
+def tiempo_por_nivel():
+    id_estudiante = request.args.get('idEstudiante', type=int)
+    if not id_estudiante:
+        return jsonify({"status": False, "mensaje": "idEstudiante es obligatorio"}), 400
+
+    con = Conexion()
+    cur = con.cursor()
+    try:
+        cur.execute("""
+            SELECT
+                e.nivel                                          AS nivel_ejercicio,
+                AVG(r.tiempo_respuesta)                         AS promedio_seg,
+                COUNT(*)                                        AS total_respuestas,
+                AVG(CASE WHEN op.es_correcta THEN 1.0
+                         ELSE 0.0 END)                         AS tasa_acierto
+            FROM respuestas_estudiantes r
+            JOIN ejercicios e
+                ON e.id_ejercicio = r.id_ejercicio
+            JOIN opciones_ejercicio op
+                ON op.id_opcion = r.id_opcion
+            WHERE r.id_estudiante    = %s
+              AND r.tiempo_respuesta IS NOT NULL
+              AND r.tiempo_respuesta > 0
+            GROUP BY e.nivel
+            ORDER BY e.nivel
+        """, (id_estudiante,))
+
+        rows = cur.fetchall() or []
+
+        # Nombres descriptivos para cada nivel de dificultad
+        _NOMBRES = {1: "Fácil", 2: "Básico", 3: "Intermedio", 4: "Avanzado"}
+
+        def _fmt(seg):
+            """Formatea segundos a '2m 28s'."""
+            if seg is None or seg < 0:
+                return "—"
+            s = int(round(seg))
+            m = s // 60
+            s = s % 60
+            if m >= 60:
+                return f"{m//60}h {m%60}m"
+            return f"{m}m {s}s" if m else f"{s}s"
+
+        niveles = []
+        for r in rows:
+            nivel   = int(r["nivel_ejercicio"] or 0)
+            prom    = float(r["promedio_seg"] or 0)
+            total   = int(r["total_respuestas"] or 0)
+            tasa    = float(r["tasa_acierto"] or 0)
+            niveles.append({
+                "nivelEjercicio":  nivel,
+                "nombreNivel":     _NOMBRES.get(nivel, f"N{nivel}"),
+                "promedioSeg":     round(prom, 1),
+                "promedioFormato": _fmt(prom),
+                "totalRespuestas": total,
+                "tasaAcierto":     round(tasa, 3),
+            })
+
+        return jsonify({"status": True, "niveles": niveles}), 200
+
+    except Exception as e:
+        print("Error en /progreso/tiempo_por_nivel:", str(e))
+        return jsonify({"status": False, "mensaje": str(e)}), 500
+    finally:
+        cur.close()
+        con.close()
