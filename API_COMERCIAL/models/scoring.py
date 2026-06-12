@@ -86,19 +86,42 @@ NIVEL_DISPLAY = {
     5: "alto",  6: "alto",  7: "alto",
 }
 
-# ── Nivel → filtro SQL de dificultad del ejercicio ──────────────────────────
-# 5 bandas distintas para que la racha y el ML tengan efecto real en cada transición
+# ── Dificultad real del ejercicio ────────────────────────────────────────────
+# La dificultad vive en ejercicios.nivel_logro (escala 1-7, la que escribe el
+# CRUD web del docente y el seed). La columna legacy `nivel` quedó abandonada
+# (todas las filas = 1), por eso se usa COALESCE: si un ejercicio antiguo no
+# tiene nivel_logro, cae a `nivel` y finalmente a 1.
+DIFICULTAD_SQL = "COALESCE(e.nivel_logro, e.nivel, 1)"
+
+# ── Nivel del alumno (NEC 1-7) → filtro SQL de dificultad del ejercicio ─────
+# Banda deslizante ~[n-1, n+1] sobre nivel_logro para que la racha y el ML
+# tengan efecto real en cada transición. NEC 1-2 comparten banda (≤3) porque
+# el banco actual no tiene ejercicios con nivel_logro < 2 en todas las
+# competencias; ampliar cuando crezca el banco.
 NIVEL_EJERCICIO_WHERE = {
-    1: "e.nivel <= 2",              # Iniciando: solo ejercicios N1-N2
-    2: "e.nivel <= 3",              # Básico: N1-N3
-    3: "e.nivel BETWEEN 2 AND 4",  # En progreso: N2-N4
-    4: "e.nivel BETWEEN 3 AND 4",  # Intermedio: N3-N4
-    5: "e.nivel >= 4",              # Avanzado: N4+
-    6: "e.nivel >= 4",              # Experto: N4+
-    7: "e.nivel >= 4",              # Maestro: máximo disponible
+    1: f"{DIFICULTAD_SQL} <= 3",             # Iniciando: lo más fácil disponible
+    2: f"{DIFICULTAD_SQL} <= 3",             # Básico
+    3: f"{DIFICULTAD_SQL} BETWEEN 2 AND 4",  # En progreso
+    4: f"{DIFICULTAD_SQL} BETWEEN 3 AND 5",  # Intermedio
+    5: f"{DIFICULTAD_SQL} BETWEEN 4 AND 6",  # Avanzado
+    6: f"{DIFICULTAD_SQL} >= 5",             # Experto
+    7: f"{DIFICULTAD_SQL} >= 6",             # Maestro: máximo disponible
 }
 
+# ── Dificultad (1-7) → banda de reporte (1-4) ───────────────────────────────
+# Los reportes "Tiempo por Dificultad" (Android + Web) usan 4 bandas con
+# nombres y colores fijos: 1=Fácil, 2=Básico, 3=Intermedio, 4=Avanzado.
+# Coincide con la semántica del seed (logro 3=Básico, 4-5=Intermedio, 6=Avanzado).
+BANDA_DIFICULTAD_SQL = (
+    f"CASE WHEN {DIFICULTAD_SQL} <= 2 THEN 1 "
+    f"WHEN {DIFICULTAD_SQL} = 3 THEN 2 "
+    f"WHEN {DIFICULTAD_SQL} <= 5 THEN 3 "
+    f"ELSE 4 END"
+)
+
 # ── Umbrales de tiempo por nivel de dificultad del ejercicio ─────────────────
+# Recibe la dificultad real (nivel_logro 1-7); los niveles 6-7 usan los
+# umbrales de N5 (clasificar_tiempo clampa a 1..5).
 # Tupla: (umbral_rapido_seg, umbral_regular_seg)
 #   t <= umbral_rapido              → "rapido"
 #   umbral_rapido < t <= umbral_regular → "regular"

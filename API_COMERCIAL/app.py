@@ -58,6 +58,12 @@ def _migrar_columnas_recursos():
             "ADD COLUMN IF NOT EXISTS id_ejercicio INTEGER "
             "REFERENCES ejercicios(id_ejercicio) ON DELETE SET NULL"
         )
+        # Normalizar competencias.area de C1 a snake_case como C2-C4:
+        # los templates del proyecto web comparan area == 'cantidad'.
+        cur.execute(
+            "UPDATE competencias SET area = 'cantidad' "
+            "WHERE id_competencia = 1 AND area <> 'cantidad'"
+        )
         con.commit()
         cur.close()
         con.close()

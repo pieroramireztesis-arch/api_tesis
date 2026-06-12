@@ -10,6 +10,7 @@ from conexionBD import Conexion
 from models.scoring import (
     calcular_delta, score_to_nivel, nivel_to_progreso,
     nivel_display_texto, NIVEL_EJERCICIO_WHERE, NIVEL_NOMBRE,
+    DIFICULTAD_SQL,
 )
 
 ws_tutor = Blueprint("ws_tutor", __name__, url_prefix="/tutor")
@@ -312,7 +313,7 @@ def ejercicio_siguiente():
                                        e.descripcion  AS enunciado,
                                        e.imagen_url,
                                        e.pista,
-                                       e.nivel        AS nivel_ejercicio,
+                                       COALESCE(e.nivel_logro, e.nivel, 1) AS nivel_ejercicio,
                                        c.id_competencia,
                                        c.descripcion  AS competencia
                                 FROM ejercicios e
@@ -399,7 +400,7 @@ def ejercicio_siguiente():
 
             nivel_adj = (min(7, nivel_base_ajuste + 1) if ajuste == "mas_dificil"
                          else max(1, nivel_base_ajuste - 1))
-            nivel_where = NIVEL_EJERCICIO_WHERE.get(nivel_adj, "e.nivel = 1")
+            nivel_where = NIVEL_EJERCICIO_WHERE.get(nivel_adj, f"{DIFICULTAD_SQL} <= 3")
             where.append(nivel_where)
             print(f"⚙️ ajuste='{ajuste}' base={nivel_base_ajuste} → nivel_adj={nivel_adj} filtro={nivel_where}")
         else:
@@ -420,9 +421,19 @@ def ejercicio_siguiente():
                 nivel_predicho_texto = nivel_display_texto(nivel_actual_int)
                 print(f"📊 Nivel global mínimo={nivel_actual_int} → '{nivel_predicho_texto}'")
 
-            # 2) Convertir predicción ML a entero para NIVEL_EJERCICIO_WHERE
-            _ML_TO_INT = {"bajo": 1, "medio": 3, "alto": 5}
-            nivel_para_ejercicio = _ML_TO_INT.get(nivel_predicho_texto, nivel_actual_int)
+            # 2) Ajuste ML conservando la granularidad del NEC (1-7):
+            #    si el ML ubica al alumno en una banda distinta a la de su NEC,
+            #    desplaza UN nivel; si coincide, mantiene el nivel exacto.
+            #    (Antes se colapsaba a 1/3/5 y un alumno NEC=4 filtraba como 3.)
+            _ORDEN_BANDA = {"bajo": 0, "medio": 1, "alto": 2}
+            banda_nec = _ORDEN_BANDA.get(nivel_display_texto(nivel_actual_int), 0)
+            banda_ml  = _ORDEN_BANDA.get(nivel_predicho_texto, banda_nec)
+            if banda_ml > banda_nec:
+                nivel_para_ejercicio = min(7, nivel_actual_int + 1)
+            elif banda_ml < banda_nec:
+                nivel_para_ejercicio = max(1, nivel_actual_int - 1)
+            else:
+                nivel_para_ejercicio = nivel_actual_int
 
             # 3) Ajuste por racha aplicado sobre el nivel predicho por ML
             if id_dominio:
@@ -434,7 +445,7 @@ def ejercicio_siguiente():
                     nivel_para_ejercicio = max(1, nivel_para_ejercicio - 1)
                     print(f"❄️ Racha negativa → nivel_ejercicio={nivel_para_ejercicio}")
 
-            nivel_where = NIVEL_EJERCICIO_WHERE.get(nivel_para_ejercicio, "e.nivel <= 3")
+            nivel_where = NIVEL_EJERCICIO_WHERE.get(nivel_para_ejercicio, f"{DIFICULTAD_SQL} <= 3")
             where.append(nivel_where)
             print(f"🎯 ML='{nivel_predicho_texto}'→{nivel_para_ejercicio} | Filtro: {nivel_where}")
 
@@ -473,7 +484,7 @@ def ejercicio_siguiente():
                    e.descripcion  AS enunciado,
                    e.imagen_url,
                    e.pista,
-                   e.nivel        AS nivel_ejercicio,
+                   COALESCE(e.nivel_logro, e.nivel, 1) AS nivel_ejercicio,
                    c.id_competencia,
                    c.descripcion  AS competencia
             FROM ejercicios e
@@ -496,7 +507,7 @@ def ejercicio_siguiente():
                        e.descripcion  AS enunciado,
                        e.imagen_url,
                        e.pista,
-                       e.nivel        AS nivel_ejercicio,
+                       COALESCE(e.nivel_logro, e.nivel, 1) AS nivel_ejercicio,
                        c.id_competencia,
                        c.descripcion  AS competencia
                 FROM ejercicios e
@@ -518,7 +529,7 @@ def ejercicio_siguiente():
                        e.descripcion  AS enunciado,
                        e.imagen_url,
                        e.pista,
-                       e.nivel        AS nivel_ejercicio,
+                       COALESCE(e.nivel_logro, e.nivel, 1) AS nivel_ejercicio,
                        c.id_competencia,
                        c.descripcion  AS competencia
                 FROM ejercicios e
@@ -629,7 +640,7 @@ def responder():
         cursor.execute("""
             SELECT o.es_correcta,
                    e.id_competencia,
-                   e.nivel AS nivel_ejercicio
+                   COALESCE(e.nivel_logro, e.nivel, 1) AS nivel_ejercicio
             FROM opciones_ejercicio o
             JOIN ejercicios e ON e.id_ejercicio = o.id_ejercicio
             WHERE o.id_opcion = %s
@@ -972,13 +983,13 @@ def sugerencias_ejercicios(id_estudiante: int, id_competencia: int):
         # Usar los mismos umbrales que ejercicio_siguiente() para consistencia
         _MAP = {"bajo": 1, "medio": 3, "alto": 5}
         nivel_int = _MAP.get(nivel_ml, 1)
-        filtro = "AND " + NIVEL_EJERCICIO_WHERE.get(nivel_int, "e.nivel <= 3")
+        filtro = "AND " + NIVEL_EJERCICIO_WHERE.get(nivel_int, f"{DIFICULTAD_SQL} <= 3")
 
         cursor.execute(f"""
             SELECT e.id_ejercicio,
                    e.descripcion  AS enunciado,
                    e.imagen_url,
-                   e.nivel        AS nivel_ejercicio,
+                   COALESCE(e.nivel_logro, e.nivel, 1) AS nivel_ejercicio,
                    c.id_competencia,
                    c.descripcion  AS competencia
             FROM ejercicios e

@@ -1,6 +1,6 @@
 from flask import Blueprint, request, jsonify
 from models.Progreso import Progreso
-from models.scoring import nivel_to_progreso, NIVEL_NOMBRE
+from models.scoring import nivel_to_progreso, NIVEL_NOMBRE, BANDA_DIFICULTAD_SQL
 from conexionBD import Conexion
 import json
 
@@ -442,9 +442,11 @@ def tiempo_por_nivel():
     con = Conexion()
     cur = con.cursor()
     try:
-        cur.execute("""
+        # Agrupa por banda de dificultad 1-4 derivada de la dificultad real
+        # (nivel_logro 1-7). La columna legacy `nivel` quedó abandonada en 1.
+        cur.execute(f"""
             SELECT
-                e.nivel                                          AS nivel_ejercicio,
+                {BANDA_DIFICULTAD_SQL}                          AS nivel_ejercicio,
                 AVG(r.tiempo_respuesta)                         AS promedio_seg,
                 COUNT(*)                                        AS total_respuestas,
                 AVG(CASE WHEN op.es_correcta THEN 1.0
@@ -457,8 +459,8 @@ def tiempo_por_nivel():
             WHERE r.id_estudiante    = %s
               AND r.tiempo_respuesta IS NOT NULL
               AND r.tiempo_respuesta > 0
-            GROUP BY e.nivel
-            ORDER BY e.nivel
+            GROUP BY 1
+            ORDER BY 1
         """, (id_estudiante,))
 
         rows = cur.fetchall() or []
