@@ -243,7 +243,9 @@ def ejercicio_siguiente():
     id_dominio    = request.args.get("idDominio",    type=int)
     ajuste        = request.args.get("ajuste",       type=str)
     modo          = (request.args.get("modo") or "repaso").lower().strip()
-    id_evaluacion = request.args.get("idEvaluacion", type=int)
+    id_evaluacion        = request.args.get("idEvaluacion",      type=int)
+    post_refuerzo        = request.args.get("postRefuerzo",      "").lower() == "true"
+    id_ejercicio_fallado = request.args.get("idEjercicioFallado", type=int)
 
     if not id_estudiante:
         return jsonify({"error": "idEstudiante es obligatorio", "status": False}), 400
@@ -386,7 +388,23 @@ def ejercicio_siguiente():
             params.append(id_dominio)
 
         # ── Selección de dificultad ───────────────────────────────────────
-        if ajuste in ("mas_dificil", "mas_facil"):
+        if post_refuerzo:
+            # Verificación post-refuerzo: misma competencia, un nivel más fácil
+            if id_dominio:
+                nivel_base_ver, _ = leer_nec(cursor, id_estudiante, id_dominio)
+            else:
+                cursor.execute("""
+                    SELECT COALESCE(MIN(nivel_actual), 1) AS nivel_min
+                    FROM nivel_estudiante_competencia
+                    WHERE id_estudiante = %s AND id_competencia BETWEEN 1 AND 4
+                """, (id_estudiante,))
+                nivel_base_ver = int((cursor.fetchone() or {}).get("nivel_min") or 1)
+
+            nivel_ver   = max(1, nivel_base_ver - 1)
+            nivel_where = NIVEL_EJERCICIO_WHERE.get(nivel_ver, f"{DIFICULTAD_SQL} <= 3")
+            where.append(nivel_where)
+            print(f"🔍 postRefuerzo: base={nivel_base_ver} → nivel_ver={nivel_ver} filtro={nivel_where}")
+        elif ajuste in ("mas_dificil", "mas_facil"):
             # Leer NEC para ajuste relativo al nivel real del estudiante
             if id_dominio:
                 nivel_base_ajuste, _ = leer_nec(cursor, id_estudiante, id_dominio)
@@ -448,6 +466,11 @@ def ejercicio_siguiente():
             nivel_where = NIVEL_EJERCICIO_WHERE.get(nivel_para_ejercicio, f"{DIFICULTAD_SQL} <= 3")
             where.append(nivel_where)
             print(f"🎯 ML='{nivel_predicho_texto}'→{nivel_para_ejercicio} | Filtro: {nivel_where}")
+
+        # ── Excluir el ejercicio que causó el refuerzo (evita repetirlo en verificación) ──
+        if post_refuerzo and id_ejercicio_fallado:
+            where.append("e.id_ejercicio != %s")
+            params.append(id_ejercicio_fallado)
 
         # ── Excluir ejercicios ya respondidos ─────────────────────────────
         if modo == "evaluacion":
@@ -621,6 +644,7 @@ def ejercicio_siguiente():
             "nivelEjercicio":             nivel_ej,
             "nivelEstudianteCompetencia": nivel_est_competencia,
             "mensaje":                    None,
+            "esVerificacion":             post_refuerzo,
         }), 200
 
     except Exception as e:
@@ -875,6 +899,35 @@ def responder():
             except Exception as e_mat:
                 print("Error buscando material/recursos:", e_mat)
 
+        # 9) Detectar 3 fallos consecutivos en la misma competencia → alerta al docente
+        docente_alertado = False
+        if es_repaso and not es_correcta:
+            try:
+                cursor.execute("""
+                    WITH ultimas AS (
+                        SELECT op2.es_correcta
+                        FROM respuestas_estudiantes r2
+                        JOIN opciones_ejercicio op2 ON op2.id_opcion  = r2.id_opcion
+                        JOIN ejercicios e2           ON e2.id_ejercicio = r2.id_ejercicio
+                        WHERE r2.id_estudiante = %s
+                          AND e2.id_competencia = %s
+                          AND r2.modo = 'repaso'
+                        ORDER BY r2.fecha DESC
+                        LIMIT 3
+                    )
+                    SELECT COUNT(*) AS total,
+                           SUM(CASE WHEN NOT es_correcta THEN 1 ELSE 0 END) AS incorrectas
+                    FROM ultimas
+                """, (id_estudiante, id_competencia))
+                row_al       = cursor.fetchone() or {}
+                total_ul     = int(row_al.get("total") or 0)
+                incorrectas_ul = int(row_al.get("incorrectas") or 0)
+                if total_ul >= 3 and incorrectas_ul >= 3:
+                    docente_alertado = True
+                    print(f"🔔 ALERTA DOCENTE: est={id_estudiante} comp={id_competencia} — 3 fallos consecutivos")
+            except Exception as e_al:
+                print("Error detectando alerta docente:", e_al)
+
         con.commit()
 
         return jsonify({
@@ -890,6 +943,7 @@ def responder():
             "nivelGlobal":          nivel_global_texto,
             "materialSugerido":     material_sugerido,
             "recursosAdicionales":  recursos_adicionales,
+            "docenteAlertado":      docente_alertado,
         }), 200
 
     except Exception as e:
