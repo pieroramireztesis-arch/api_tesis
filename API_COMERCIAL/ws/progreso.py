@@ -257,19 +257,20 @@ def historial_progreso():
                 e.descripcion AS ejercicio,
                 e.id_competencia,
                 r2.desarrollo_url,
-                COUNT(
-                    CASE WHEN r.id_opcion IS NOT NULL
-                         AND op.es_correcta = FALSE
-                         THEN 1 END
+                -- Solo cuenta las respuestas incorrectas ANTERIORES a este registro
+                -- de progreso para reflejar los intentos de este intento específico.
+                (
+                    SELECT COUNT(*)
+                    FROM respuestas_estudiantes r
+                    JOIN opciones_ejercicio op ON op.id_opcion = r.id_opcion
+                    WHERE r.id_estudiante = p.id_estudiante
+                      AND r.id_ejercicio  = p.id_ejercicio
+                      AND op.es_correcta  = FALSE
+                      AND r.fecha        <= p.fecha
                 ) AS intentos_incorrectos
             FROM progreso p
             JOIN ejercicios e
                 ON e.id_ejercicio = p.id_ejercicio
-            LEFT JOIN respuestas_estudiantes r
-                ON r.id_estudiante = p.id_estudiante
-               AND r.id_ejercicio  = p.id_ejercicio
-            LEFT JOIN opciones_ejercicio op
-                ON op.id_opcion = r.id_opcion
             LEFT JOIN respuestas_estudiantes r2
                 ON r2.id_respuesta = (
                     SELECT r3.id_respuesta
@@ -281,15 +282,6 @@ def historial_progreso():
                     LIMIT 1
                 )
             WHERE p.id_estudiante = %s
-            GROUP BY
-                p.id_progreso,
-                p.id_ejercicio,
-                p.estado,
-                p.fecha,
-                p.modo,
-                e.descripcion,
-                e.id_competencia,
-                r2.desarrollo_url
             ORDER BY p.id_progreso DESC
             LIMIT %s OFFSET %s
         """, (id_estudiante, limite, offset))
@@ -315,7 +307,7 @@ def historial_progreso():
 
             fecha_raw = r.get("fecha")
             fecha_str = str(fecha_raw).replace(" ", "T")[:19] if fecha_raw else ""
-            intentos  = int(r.get("intentos_incorrectos") or 0)
+            intentos  = max(int(r.get("intentos_incorrectos") or 0), 0)
 
             items.append({
                 "idProgreso":          r["id_progreso"],
